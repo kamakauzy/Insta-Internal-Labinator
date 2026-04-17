@@ -1,0 +1,15 @@
+# Insta-Internal-Labinator generated files
+logs/
+*.log
+RedTeam-Handoff-*/
+custom-ansible-vars/
+attacker-vm/.vagrant/
+GOAD/
+vmnet-config.txt
+*.vmx
+*.vmdk
+*.nvram
+*.vmsd
+*.vmss
+*.vmem
+.vagrant/
