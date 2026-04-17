@@ -1,17 +1,16 @@
 {
-  "clientName": "Acme Corp",
+  "_comment": "All fields are OPTIONAL. Missing fields are randomized automatically.",
+  "clientName": "Acme Corporation",
   "domain": "acmecorp.local",
   "cidr": "192.168.56.0/24",
   "lowPrivUser": {
     "username": "j.smith",
     "password": "Summer2026!"
   },
-  "c2DockerImage": "yourcompany/c2-beacon:latest",
-  "c2EnvVars": {
-    "SAAS_TOKEN": "replace-with-your-token",
-    "CALLBACK_URL": "https://c2.your-saas.com"
-  },
+  "c2DockerImage": "",
+  "c2EnvVars": {},
   "labVariant": "GOAD-Light",
+  "misconfigSeed": 0,
   "attackerVm": {
     "ramMB": 4096,
     "cpus": 2
