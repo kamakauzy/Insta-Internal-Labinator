@@ -1,0 +1,50 @@
+# Insta-Internal-Labinator — Docker Compose
+# INTERNAL ONLY. Never ships to clients.
+#
+# Usage (Windows host):
+#   docker-compose up -d
+#
+# Then open http://localhost:8445 in your browser.
+# The auth token is printed in the container logs:
+#   docker-compose logs labinator | grep Token
+#
+# NOTE: vmrun.exe operations require the host-side proxy:
+#   Start-Process -NoNewWindow powershell .\scripts\vmrun-proxy.ps1
+# Then set VMRUN_PROXY_URL=http://host.docker.internal:9876 below.
+
+services:
+  labinator:
+    build: .
+    container_name: labinator
+    ports:
+      - "8445:8445"
+    volumes:
+      # Docker socket for container management
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Bind-mount VMware Workstation dir for vmrun.exe access
+      # On Linux containers (Docker Desktop/WSL2), vmrun.exe cannot execute
+      # natively. Use vmrun-proxy.ps1 on the Windows host instead.
+      - ${VMWARE_PATH:-C:\Program Files (x86)\VMware\VMware Workstation}:/vmware:ro
+      # GOAD workspace for VM discovery (read-only)
+      - ${GOAD_WORKSPACE:-D:\HAK\internal-lab-inator\GOAD\workspace}:/goad-workspace:ro
+      # Persist auth token across restarts
+      - labinator-data:/app/dashboard/.auth_token_dir
+    environment:
+      # Path to vmrun.exe inside the container (Linux: use proxy; Windows container: /vmware/vmrun.exe)
+      VMRUN_PATH: ${VMRUN_PATH:-/vmware/vmrun.exe}
+      # URL of optional Windows-side vmrun proxy (for Linux containers)
+      VMRUN_PROXY_URL: ${VMRUN_PROXY_URL:-}
+      # Override GOAD workspace path inside the container
+      GOAD_WORKSPACE_PATH: /goad-workspace
+      # Lab identity
+      LAB_NAME: ${LAB_NAME:-GOAD-Light}
+      LAB_IP_RANGE: ${LAB_IP_RANGE:-192.168.56}
+    # network_mode: host gives full access to lab network (192.168.56.x)
+    # On Docker Desktop for Windows, host networking maps to the WSL2 VM —
+    # 192.168.56.x may not be reachable. Use the VMware network adapter
+    # on the host instead (run natively) for full lab connectivity.
+    network_mode: host
+    restart: unless-stopped
+
+volumes:
+  labinator-data:
