@@ -13,3 +13,10 @@ vmnet-config.txt
 *.vmss
 *.vmem
 .vagrant/
+*.bak
+*.v2bak
+*.v3
+dashboard/
+internal-inator/
+.venv/
+.kube/
