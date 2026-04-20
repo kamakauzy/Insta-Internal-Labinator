@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario: ADCS Certificate Carnage
+# Exploit vulnerable certificate templates for domain takeover
+# ═══════════════════════════════════════════════════════════════════════════
+name: ADCS Certificate Carnage
+description: >
+  The enterprise CA has multiple misconfigured certificate templates.
+  Chain ESC1 (enrollee supplies subject) and ESC8 (HTTP relay) attacks
+  to obtain a Domain Admin certificate. Harder than it looks.
+difficulty: hard
+author: labinator
+tags: [adcs, certificates, esc1, esc8, relay, advanced]
+
+machines:
+  - name: CA-SERVER
+    role: certificate_authority
+    target_vm: dc01
+    services:
+      - adcs
+      - ldap
+      - dns
+    vulnerabilities:
+      - adcs_esc1
+      - adcs_esc4
+      - adcs_esc8
+      - print_spooler_on_dc
+
+  - name: DC-NORTH
+    role: domain_controller
+    target_vm: dc02
+    services:
+      - ldap
+      - dns
+    vulnerabilities:
+      - ntlmv1_allowed
+      - ldap_signing_disabled
+
+  - name: TARGET-SRV
+    role: file_server
+    target_vm: srv02
+    services:
+      - name: smb
+        signing: false
+      - rdp
+    vulnerabilities:
+      - smb_signing_disabled
+      - webdav_enabled
+
+objectives:
+  - "Enumerate ADCS templates with Certipy"
+  - "Identify ESC1 vulnerable template"
+  - "Request certificate with Domain Admin SAN"
+  - "Use ESC8 to relay NTLM to web enrollment"
+  - "Authenticate with forged certificate for DA"

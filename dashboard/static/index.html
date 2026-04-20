@@ -1,0 +1,1066 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Labinator Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<style>
+  body { font-family: 'Inter', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+  .sidebar { width: 220px; background: #1e293b; }
+  .main-content { margin-left: 220px; }
+  .nav-item { transition: all .15s; }
+  .nav-item:hover, .nav-item.active { background: rgba(220,38,38,.15); border-left: 3px solid #dc2626; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: .5rem; }
+  .badge-up { background: #065f46; color: #6ee7b7; }
+  .badge-down { background: #7f1d1d; color: #fca5a5; }
+  .badge-warn { background: #78350f; color: #fcd34d; }
+  .btn { padding: .375rem .75rem; border-radius: .375rem; font-size: .875rem; font-weight: 500; cursor: pointer; transition: all .15s; }
+  .btn-red { background: #dc2626; color: #fff; } .btn-red:hover { background: #b91c1c; }
+  .btn-green { background: #16a34a; color: #fff; } .btn-green:hover { background: #15803d; }
+  .btn-gray { background: #475569; color: #fff; } .btn-gray:hover { background: #64748b; }
+  .btn-amber { background: #d97706; color: #fff; } .btn-amber:hover { background: #b45309; }
+  .log-viewer { background: #0f172a; border: 1px solid #334155; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: .75rem; line-height: 1.4; max-height: 400px; overflow-y: auto; padding: .75rem; border-radius: .375rem; white-space: pre-wrap; word-break: break-all; }
+  .pulse { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+  select, input { background: #0f172a; border: 1px solid #475569; color: #e2e8f0; border-radius: .375rem; padding: .375rem .5rem; font-size: .875rem; }
+  input:focus, select:focus { outline: none; border-color: #dc2626; box-shadow: 0 0 0 2px rgba(220,38,38,.25); }
+  ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #1e293b; } ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+</style>
+</head>
+<body x-data="dashboard()" x-init="init()">
+
+<!-- Login Gate -->
+<template x-if="!authed">
+<div class="min-h-screen flex items-center justify-center">
+  <div class="card p-8 w-96">
+    <h1 class="text-xl font-bold mb-1 text-red-500">🔒 Labinator Dashboard</h1>
+    <p class="text-sm text-slate-400 mb-6">Enter your auth token to continue</p>
+    <input x-model="tokenInput" @keydown.enter="login()" type="password"
+           placeholder="Bearer token" class="w-full mb-4">
+    <p x-show="loginError" class="text-red-400 text-sm mb-3" x-text="loginError"></p>
+    <button @click="login()" class="btn btn-red w-full">Authenticate</button>
+  </div>
+</div>
+</template>
+
+<!-- Main Dashboard -->
+<template x-if="authed">
+<div class="flex min-h-screen">
+
+  <!-- Sidebar -->
+  <div class="sidebar fixed top-0 left-0 h-full flex flex-col py-4 z-10">
+    <div class="px-4 mb-6">
+      <h1 class="text-lg font-bold text-red-500">LABINATOR</h1>
+      <p class="text-xs text-slate-500">Internal Lab Control</p>
+    </div>
+    <nav class="flex-1">
+      <template x-for="item in navItems" :key="item.id">
+        <a @click="page = item.id" :class="{'active': page === item.id}"
+           class="nav-item flex items-center gap-3 px-4 py-2.5 cursor-pointer text-sm text-slate-300">
+          <span x-text="item.icon"></span>
+          <span x-text="item.label"></span>
+        </a>
+      </template>
+    </nav>
+    <div class="px-4 py-3 border-t border-slate-700">
+      <button @click="logout()" class="text-xs text-slate-500 hover:text-red-400">Logout</button>
+    </div>
+  </div>
+
+  <!-- Content Area -->
+  <div class="main-content flex-1 p-6">
+
+    <!-- ═══ OVERVIEW ═══ -->
+    <div x-show="page === 'overview'">
+      <h2 class="text-xl font-bold mb-4">Lab Overview</h2>
+      <div class="grid grid-cols-3 gap-4 mb-6">
+        <div class="card p-4">
+          <div class="text-sm text-slate-400 mb-1">Virtual Machines</div>
+          <div class="text-2xl font-bold" x-text="data.vms?.length || 0"></div>
+          <div class="text-xs mt-1">
+            <span class="text-green-400" x-text="(data.vms?.filter(v=>v.running)||[]).length + ' running'"></span>
+          </div>
+        </div>
+        <div class="card p-4">
+          <div class="text-sm text-slate-400 mb-1">Docker Containers</div>
+          <div class="text-2xl font-bold" x-text="data.containers?.length || 0"></div>
+          <div class="text-xs mt-1">
+            <span class="text-green-400" x-text="(data.containers?.filter(c=>c.healthy)||[]).length + ' healthy'"></span>
+          </div>
+        </div>
+        <div class="card p-4">
+          <div class="text-sm text-slate-400 mb-1">VMnet2 Status</div>
+          <div class="text-lg font-bold" x-text="data.network?.vmnet2?.ip || 'Not found'"></div>
+          <div class="text-xs mt-1" :class="data.network?.vmnet2 ? 'text-green-400' : 'text-red-400'"
+               x-text="data.network?.vmnet2 ? 'Active' : 'Missing'"></div>
+        </div>
+      </div>
+
+      <!-- VM Status Cards -->
+      <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase">GOAD VMs</h3>
+      <div class="grid grid-cols-3 gap-4 mb-6">
+        <template x-for="vm in (data.vms || [])" :key="vm.id">
+          <div class="card p-4">
+            <div class="flex justify-between items-start mb-2">
+              <div>
+                <div class="font-semibold text-sm" x-text="vm.name"></div>
+                <div class="text-xs text-slate-500" x-text="vm.hostname"></div>
+              </div>
+              <span class="text-xs px-2 py-0.5 rounded-full"
+                    :class="vm.running ? 'badge-up' : 'badge-down'"
+                    x-text="vm.running ? 'Running' : 'Stopped'"></span>
+            </div>
+            <div class="text-xs text-slate-400 space-y-0.5">
+              <div><span class="text-slate-500">IP:</span> <span x-text="vm.ip || '—'"></span></div>
+              <div><span class="text-slate-500">Domain:</span> <span x-text="vm.domain || '—'"></span></div>
+              <div><span class="text-slate-500">Role:</span> <span x-text="vm.role || '—'"></span></div>
+              <div x-show="vm.reachable !== undefined">
+                <span class="text-slate-500">WinRM:</span>
+                <span :class="vm.reachable ? 'text-green-400' : 'text-red-400'" x-text="vm.reachable ? '✓ Reachable' : '✗ Unreachable'"></span>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- Container Status -->
+      <h3 class="text-sm font-semibold text-slate-400 mb-2 uppercase">Docker Containers</h3>
+      <div class="card overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-800/50">
+            <tr><th class="text-left p-3 text-slate-400 font-medium">Name</th>
+                <th class="text-left p-3 text-slate-400 font-medium">Image</th>
+                <th class="text-left p-3 text-slate-400 font-medium">Status</th>
+                <th class="text-left p-3 text-slate-400 font-medium">Ports</th></tr>
+          </thead>
+          <tbody>
+            <template x-for="c in (data.containers || [])" :key="c.name">
+              <tr class="border-t border-slate-700/50">
+                <td class="p-3 font-mono text-xs" x-text="c.name"></td>
+                <td class="p-3 text-xs text-slate-400" x-text="c.image"></td>
+                <td class="p-3"><span class="text-xs px-2 py-0.5 rounded-full"
+                    :class="c.healthy ? 'badge-up' : 'badge-down'" x-text="c.status"></span></td>
+                <td class="p-3 text-xs text-slate-400" x-text="c.ports || '—'"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ═══ VMS ═══ -->
+    <div x-show="page === 'vms'">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-xl font-bold">Virtual Machines</h2>
+        <div class="flex gap-2">
+          <button @click="vmActionAll('start-all')" class="btn btn-green text-xs">▶ Start All</button>
+          <button @click="vmActionAll('stop-all')" class="btn btn-red text-xs">■ Stop All</button>
+          <button @click="refreshVMs()" class="btn btn-gray text-xs">↻ Refresh</button>
+        </div>
+      </div>
+
+      <template x-for="vm in vmList" :key="vm.id">
+        <div class="card p-4 mb-4">
+          <div class="flex justify-between items-start mb-3">
+            <div>
+              <span class="font-semibold" x-text="vm.name"></span>
+              <span class="text-xs text-slate-500 ml-2" x-text="vm.hostname + ' — ' + vm.domain"></span>
+              <span class="text-xs px-2 py-0.5 rounded-full ml-2"
+                    :class="vm.running ? 'badge-up' : 'badge-down'"
+                    x-text="vm.running ? 'Running' : 'Stopped'"></span>
+            </div>
+            <div class="flex gap-1">
+              <button @click="vmAction(vm.id, 'start')" class="btn btn-green text-xs" :disabled="vm.running">▶</button>
+              <button @click="vmAction(vm.id, 'stop')" class="btn btn-red text-xs" :disabled="!vm.running">■</button>
+              <button @click="vmAction(vm.id, 'suspend')" class="btn btn-amber text-xs" :disabled="!vm.running">⏸</button>
+              <button @click="vmAction(vm.id, 'reset')" class="btn btn-gray text-xs" :disabled="!vm.running">↻</button>
+            </div>
+          </div>
+          <div class="text-xs text-slate-400 mb-3">
+            <span class="mr-4">IP: <span class="text-slate-200" x-text="vm.ip || '—'"></span></span>
+            <span>Role: <span class="text-slate-200" x-text="vm.role || '—'"></span></span>
+          </div>
+
+          <!-- Snapshots -->
+          <div class="bg-slate-900/50 rounded p-3">
+            <div class="text-xs font-semibold text-slate-400 mb-2">Snapshots</div>
+            <div class="flex flex-wrap gap-2 mb-2">
+              <template x-for="snap in (vm.snapshots || [])" :key="snap">
+                <div class="flex items-center gap-1 bg-slate-800 rounded px-2 py-1 text-xs">
+                  <span x-text="snap"></span>
+                  <button @click="snapAction(vm.id, 'revert', snap)" class="text-blue-400 hover:text-blue-300 ml-1" title="Revert">↩</button>
+                  <button @click="snapAction(vm.id, 'delete', snap)" class="text-red-400 hover:text-red-300" title="Delete">✕</button>
+                </div>
+              </template>
+              <div x-show="!vm.snapshots?.length" class="text-xs text-slate-500">No snapshots</div>
+            </div>
+            <div class="flex gap-2 mt-2">
+              <input x-model="newSnapName" placeholder="Snapshot name" class="text-xs flex-1">
+              <button @click="snapAction(vm.id, 'create', newSnapName); newSnapName=''" class="btn btn-gray text-xs">Create</button>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- ═══ DOCKER ═══ -->
+    <div x-show="page === 'docker'">
+      <h2 class="text-xl font-bold mb-4">Docker & Agent</h2>
+
+      <!-- Containers -->
+      <div class="card p-4 mb-4">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="font-semibold">Containers</h3>
+          <button @click="refreshContainers()" class="btn btn-gray text-xs">↻ Refresh</button>
+        </div>
+        <div class="space-y-2">
+          <template x-for="c in containerList.containers || []" :key="c.name">
+            <div class="flex justify-between items-center bg-slate-900/50 rounded p-3">
+              <div>
+                <span class="font-mono text-sm" x-text="c.name"></span>
+                <span class="text-xs text-slate-500 ml-2" x-text="c.image"></span>
+                <span class="text-xs px-2 py-0.5 rounded-full ml-2"
+                      :class="c.healthy ? 'badge-up' : 'badge-down'" x-text="c.status"></span>
+              </div>
+              <div class="flex gap-1">
+                <button @click="containerAction(c.name, 'start')" class="btn btn-green text-xs">▶</button>
+                <button @click="containerAction(c.name, 'stop')" class="btn btn-red text-xs">■</button>
+                <button @click="containerAction(c.name, 'restart')" class="btn btn-amber text-xs">↻</button>
+                <button @click="viewLogs(c.name)" class="btn btn-gray text-xs">📋</button>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Images -->
+      <div class="card p-4 mb-4">
+        <h3 class="font-semibold mb-3">Images</h3>
+        <div class="space-y-1">
+          <template x-for="img in containerList.images || []" :key="img.id">
+            <div class="flex justify-between items-center text-xs bg-slate-900/50 rounded p-2">
+              <span class="font-mono" x-text="img.repository + ':' + img.tag"></span>
+              <div class="flex gap-4 text-slate-400">
+                <span x-text="img.size"></span>
+                <span x-text="img.created"></span>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Build Sandbox -->
+      <div class="card p-4 mb-4">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="font-semibold">Rebuild Sandbox Image</h3>
+          <button @click="startBuild()" class="btn btn-red text-xs" :disabled="buildRunning">
+            <span x-show="!buildRunning">🔨 Build</span>
+            <span x-show="buildRunning" class="pulse">Building…</span>
+          </button>
+        </div>
+        <div x-show="buildOutput.length > 0" class="log-viewer" x-ref="buildLog">
+          <template x-for="line in buildOutput" :key="$id('bl')">
+            <div x-text="line"></div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Container Logs -->
+      <div x-show="logContainer" class="card p-4">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="font-semibold">Logs: <span class="font-mono text-red-400" x-text="logContainer"></span></h3>
+          <button @click="logContainer=''; logContent=''" class="btn btn-gray text-xs">Close</button>
+        </div>
+        <div class="log-viewer" x-text="logContent"></div>
+      </div>
+    </div>
+
+    <!-- ═══ NETWORK ═══ -->
+    <div x-show="page === 'network'">
+      <h2 class="text-xl font-bold mb-4">Network & Firewall</h2>
+
+      <!-- Interfaces -->
+      <div class="card p-4 mb-4">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="font-semibold">Network Interfaces</h3>
+          <button @click="refreshNetwork()" class="btn btn-gray text-xs">↻ Refresh</button>
+        </div>
+        <div class="space-y-2">
+          <template x-for="iface in interfaces" :key="iface.alias">
+            <div class="flex justify-between items-center bg-slate-900/50 rounded p-3">
+              <div>
+                <span class="font-semibold text-sm" x-text="iface.alias"></span>
+                <span class="font-mono text-sm text-slate-300 ml-3" x-text="iface.ip + '/' + iface.prefix"></span>
+              </div>
+              <button @click="editIface = iface" class="btn btn-gray text-xs">Edit</button>
+            </div>
+          </template>
+        </div>
+
+        <!-- Edit Interface -->
+        <div x-show="editIface" class="mt-4 bg-slate-900/50 rounded p-3">
+          <div class="text-sm font-semibold mb-2">Configure: <span x-text="editIface?.alias"></span></div>
+          <div class="flex gap-2">
+            <input x-model="editIfaceIP" placeholder="IP Address" class="flex-1 text-sm">
+            <input x-model="editIfacePrefix" type="number" placeholder="Prefix" class="w-20 text-sm">
+            <button @click="configureIface()" class="btn btn-green text-xs">Apply</button>
+            <button @click="editIface=null" class="btn btn-gray text-xs">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Firewall -->
+      <div class="card p-4 mb-4">
+        <div class="flex justify-between items-center mb-3">
+          <h3 class="font-semibold">Firewall Rules (Lab-related)</h3>
+        </div>
+        <div class="space-y-1">
+          <template x-for="rule in firewallRules" :key="rule.name">
+            <div class="flex justify-between items-center bg-slate-900/50 rounded p-2 text-xs">
+              <div class="flex gap-4">
+                <span class="font-semibold w-40 truncate" x-text="rule.name"></span>
+                <span class="text-slate-400" x-text="rule.direction"></span>
+                <span :class="rule.action === 'Allow' ? 'text-green-400' : 'text-red-400'" x-text="rule.action"></span>
+                <span class="text-slate-400" x-text="rule.protocol + (rule.local_port ? ':' + rule.local_port : '')"></span>
+              </div>
+              <button @click="deleteFirewall(rule.name)" class="text-red-400 hover:text-red-300">✕</button>
+            </div>
+          </template>
+          <div x-show="!firewallRules.length" class="text-xs text-slate-500 p-2">No lab firewall rules found</div>
+        </div>
+
+        <!-- Add Rule -->
+        <div class="mt-4 bg-slate-900/50 rounded p-3">
+          <div class="text-sm font-semibold mb-2">Add Rule</div>
+          <div class="grid grid-cols-6 gap-2">
+            <input x-model="newRule.name" placeholder="Name" class="text-xs">
+            <select x-model="newRule.direction" class="text-xs">
+              <option value="Inbound">Inbound</option><option value="Outbound">Outbound</option>
+            </select>
+            <select x-model="newRule.protocol" class="text-xs">
+              <option value="TCP">TCP</option><option value="UDP">UDP</option><option value="Any">Any</option>
+            </select>
+            <input x-model="newRule.local_port" placeholder="Port" class="text-xs">
+            <input x-model="newRule.remote_address" placeholder="Remote IP" class="text-xs">
+            <button @click="addFirewall()" class="btn btn-green text-xs">Add</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Connectivity Check -->
+      <div class="card p-4">
+        <h3 class="font-semibold mb-3">Connectivity Check</h3>
+        <div class="grid grid-cols-3 gap-3">
+          <template x-for="vm in (data.vms || [])" :key="vm.id">
+            <div class="flex items-center gap-2 bg-slate-900/50 rounded p-3">
+              <span class="w-3 h-3 rounded-full" :class="vm.reachable ? 'bg-green-500' : vm.reachable === false ? 'bg-red-500' : 'bg-slate-600'"></span>
+              <div>
+                <div class="text-sm font-semibold" x-text="vm.hostname"></div>
+                <div class="text-xs text-slate-400" x-text="vm.ip + ':5986'"></div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ DEPLOY ═══ -->
+    <div x-show="page === 'deploy'">
+      <h2 class="text-xl font-bold mb-4">Lab Deployment</h2>
+
+      <div class="card p-4 mb-4">
+        <h3 class="font-semibold mb-3">Deploy Red Team Lab</h3>
+        <p class="text-sm text-slate-400 mb-4">Run Deploy-RedTeamLab.ps1 to configure and deploy the lab environment with randomized misconfigurations.</p>
+
+        <div class="grid grid-cols-2 gap-4 mb-4">
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Company Name (optional)</label>
+            <input x-model="deployOpts.company" placeholder="Auto-generated if empty" class="w-full text-sm">
+          </div>
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Misconfiguration Seed (optional)</label>
+            <input x-model="deployOpts.seed" type="number" placeholder="Random" class="w-full text-sm">
+          </div>
+        </div>
+
+        <button @click="alert('Deploy via the PowerShell scripts directly for now. Full integration coming soon.')"
+                class="btn btn-red">🚀 Deploy Lab</button>
+      </div>
+
+      <!-- Previous Handoffs -->
+      <div class="card p-4">
+        <h3 class="font-semibold mb-3">Previous Handoffs</h3>
+        <div class="space-y-2">
+          <template x-for="h in handoffs" :key="h.name">
+            <div class="bg-slate-900/50 rounded p-3">
+              <div class="font-semibold text-sm" x-text="h.name"></div>
+              <div class="text-xs text-slate-400 mt-1">
+                <template x-for="f in h.files" :key="f">
+                  <span class="bg-slate-800 rounded px-1.5 py-0.5 mr-1" x-text="f"></span>
+                </template>
+              </div>
+            </div>
+          </template>
+          <div x-show="!handoffs.length" class="text-xs text-slate-500">No previous deployments found</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ LAB DESIGNER ═══ -->
+    <div x-show="page === 'designer'">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-xl font-bold">🎯 Lab Designer</h2>
+        <div class="flex gap-2">
+          <select @change="if($event.target.value) loadScenario($event.target.value); $event.target.value=''"
+                  class="text-sm">
+            <option value="">Load scenario…</option>
+            <template x-for="s in scenarioList" :key="s.id">
+              <option :value="s.id" x-text="(s.is_example ? '📋 ' : '💾 ') + s.name + ' (' + s.difficulty + ')'"></option>
+            </template>
+          </select>
+          <button @click="saveCurrentScenario()" class="btn btn-green text-xs" :disabled="!designer.name">💾 Save</button>
+          <button @click="previewPlaybook()" class="btn btn-gray text-xs" :disabled="!designer.machines.length">📄 Preview</button>
+          <button @click="deleteCurrentScenario()" class="btn btn-red text-xs"
+                  :disabled="!designer._id || scenarioDeployRunning"
+                  x-show="designer._id && !scenarioList.find(s => s.id === designer._id)?.is_example">🗑️ Delete</button>
+          <button @click="deployScenario()" class="btn btn-red text-xs"
+                  :disabled="!designer._id || scenarioDeployRunning">🚀 Deploy</button>
+        </div>
+      </div>
+
+      <!-- Scenario Info -->
+      <div class="card p-4 mb-4">
+        <div class="grid grid-cols-3 gap-4">
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Scenario Name</label>
+            <input x-model="designer.name" placeholder="My Lab Scenario" class="w-full">
+          </div>
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Difficulty</label>
+            <select x-model="designer.difficulty" class="w-full">
+              <option value="easy">🟢 Easy</option>
+              <option value="medium">🟡 Medium</option>
+              <option value="hard">🟠 Hard</option>
+              <option value="insane">🔴 Insane</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs text-slate-400 block mb-1">Description</label>
+            <input x-model="designer.description" placeholder="What's the story?" class="w-full">
+          </div>
+        </div>
+      </div>
+
+      <!-- Machines -->
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Machines</h3>
+        <button @click="addMachine()" class="btn btn-green text-xs">+ Add Machine</button>
+      </div>
+
+      <template x-for="(machine, mi) in designer.machines" :key="mi">
+        <div class="card p-4 mb-3">
+          <div class="flex items-start justify-between mb-3">
+            <div class="grid grid-cols-4 gap-3 flex-1">
+              <div>
+                <label class="text-xs text-slate-400 block mb-1">Name</label>
+                <input x-model="machine.name" placeholder="WS01" class="w-full text-sm">
+              </div>
+              <div>
+                <label class="text-xs text-slate-400 block mb-1">Role</label>
+                <select x-model="machine.role" x-effect="$el.value = machine.role" class="w-full text-sm">
+                  <template x-for="(rdef, rkey) in (catalog.roles || {})" :key="rkey">
+                    <option :value="rkey" x-text="rdef.label" :selected="rkey === machine.role"></option>
+                  </template>
+                </select>
+              </div>
+              <div>
+                <label class="text-xs text-slate-400 block mb-1">Target VM</label>
+                <select x-model="machine.target_vm" class="w-full text-sm">
+                  <option value="dc01">dc01 — kingslanding (10)</option>
+                  <option value="dc02">dc02 — winterfell (11)</option>
+                  <option value="srv02">srv02 — castelblack (22)</option>
+                  <option value="lx01">lx01 — dragonstone (32)</option>
+                </select>
+              </div>
+              <div class="flex items-end">
+                <button @click="designer.machines.splice(mi, 1)" class="btn btn-gray text-xs">✕ Remove</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Services -->
+          <div class="mb-3">
+            <div class="flex items-center gap-2 mb-2">
+              <span class="text-xs font-semibold text-slate-400">SERVICES</span>
+              <div class="flex flex-wrap gap-1">
+                <template x-for="(sdef, skey) in (catalog.services || {})" :key="skey">
+                  <button @click="toggleService(machine, skey)"
+                          :class="hasService(machine, skey) ? 'bg-blue-600 text-white' : 'bg-slate-700 text-slate-300'"
+                          class="px-2 py-0.5 rounded text-xs cursor-pointer hover:brightness-110"
+                          x-text="sdef.label || skey"></button>
+                </template>
+              </div>
+            </div>
+          </div>
+
+          <!-- SMB Config (shown when SMB service is active) -->
+          <template x-if="hasService(machine, 'smb')">
+            <div class="bg-slate-900/50 rounded p-3 mb-3">
+              <div class="flex items-center gap-3 mb-2">
+                <label class="flex items-center gap-1.5 text-xs">
+                  <input type="checkbox" x-model="getSmbConfig(machine).signing"
+                         class="rounded bg-slate-800 border-slate-600">
+                  <span>Require SMB Signing</span>
+                </label>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="text-xs text-slate-400">Shares:</span>
+                <template x-for="(sh, si) in (getSmbConfig(machine).shares || [])" :key="si">
+                  <span class="bg-slate-800 text-xs rounded px-2 py-0.5 flex items-center gap-1">
+                    <span x-text="sh"></span>
+                    <button @click="getSmbConfig(machine).shares.splice(si, 1)"
+                            class="text-red-400 hover:text-red-300 ml-1">×</button>
+                  </span>
+                </template>
+                <input @keydown.enter="if($event.target.value) { getSmbConfig(machine).shares.push($event.target.value); $event.target.value = ''; }"
+                       placeholder="Add share…" class="text-xs w-28">
+              </div>
+            </div>
+          </template>
+
+          <!-- Vulnerabilities -->
+          <div>
+            <span class="text-xs font-semibold text-slate-400 mb-2 block">VULNERABILITIES</span>
+            <div class="grid grid-cols-1 gap-1">
+              <template x-for="cat in vulnCategories" :key="cat">
+                <div x-show="hasVulnsForRole(cat, machine.role)">
+                  <div class="text-xs text-slate-500 uppercase tracking-wider mb-1 mt-2" x-text="cat.replace('_', ' ')"></div>
+                  <div class="flex flex-wrap gap-1">
+                    <template x-for="(vdef, vkey) in getVulnsForCategory(cat)" :key="vkey">
+                      <template x-if="vdef.targets && vdef.targets.includes(machine.role)">
+                        <button @click="toggleVuln(machine, vkey)"
+                                :class="hasVuln(machine, vkey) ? severityBtnClass(vdef.severity) : 'bg-slate-700/50 text-slate-400 border border-slate-600'"
+                                class="px-2 py-1 rounded text-xs cursor-pointer hover:brightness-110 transition-all"
+                                :title="vdef.description">
+                          <span x-text="vdef.label"></span>
+                          <span class="ml-1 opacity-60" x-text="severityIcon(vdef.severity)"></span>
+                        </button>
+                      </template>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <!-- Machine Summary -->
+          <div class="mt-3 pt-3 border-t border-slate-700 flex gap-3 text-xs text-slate-400">
+            <span>Services: <span class="text-blue-400" x-text="machine.services?.length || 0"></span></span>
+            <span>Vulns: <span class="text-red-400" x-text="machine.vulnerabilities?.length || 0"></span></span>
+            <span>Target: <span class="text-green-400" x-text="machine.target_vm || 'auto'"></span></span>
+          </div>
+        </div>
+      </template>
+
+      <!-- No machines placeholder -->
+      <div x-show="!designer.machines.length" class="card p-8 text-center text-slate-500 mb-4">
+        <div class="text-3xl mb-2">🎯</div>
+        <div>Click "Add Machine" to start designing your lab scenario</div>
+        <div class="text-xs mt-1">Or load an example scenario from the dropdown above</div>
+      </div>
+
+      <!-- Playbook Preview -->
+      <div x-show="playbookPreview" class="card p-4 mb-4">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">📄 Generated Playbook</h3>
+          <button @click="playbookPreview = ''" class="btn btn-gray text-xs">Close</button>
+        </div>
+        <div class="log-viewer text-green-300" x-text="playbookPreview" style="max-height: 500px"></div>
+      </div>
+
+      <!-- Deploy Output -->
+      <div x-show="scenarioDeployOutput.length" class="card p-4 mb-4">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="font-semibold">
+            <span x-show="scenarioDeployRunning" class="text-amber-400 pulse">● Deploying…</span>
+            <span x-show="!scenarioDeployRunning">Deployment Output</span>
+          </h3>
+          <button @click="scenarioDeployOutput = []" class="btn btn-gray text-xs"
+                  :disabled="scenarioDeployRunning">Clear</button>
+        </div>
+        <div class="log-viewer" x-ref="deployLog" style="max-height: 400px">
+          <template x-for="(line, i) in scenarioDeployOutput" :key="i">
+            <div x-text="line"></div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="fixed bottom-0 right-0 left-56 bg-slate-800/80 backdrop-blur border-t border-slate-700 px-4 py-1.5 flex justify-between items-center text-xs">
+      <div class="flex items-center gap-3">
+        <span x-show="loading" class="text-amber-400 pulse">● Loading…</span>
+        <span x-show="!loading" class="text-green-400">● Ready</span>
+        <span x-show="statusMsg" class="text-slate-400" x-text="statusMsg"></span>
+      </div>
+      <div class="text-slate-500">Auto-refresh: 10s</div>
+    </div>
+
+  </div>
+</div>
+</template>
+
+<script>
+function dashboard() {
+  return {
+    // Auth
+    authed: false,
+    token: '',
+    tokenInput: '',
+    loginError: '',
+
+    // Nav
+    page: 'overview',
+    navItems: [
+      { id: 'overview', icon: '📊', label: 'Overview' },
+      { id: 'vms',      icon: '🖥️', label: 'Virtual Machines' },
+      { id: 'docker',   icon: '🐳', label: 'Docker & Agent' },
+      { id: 'network',  icon: '🌐', label: 'Network' },
+      { id: 'deploy',   icon: '🚀', label: 'Lab Deploy' },
+      { id: 'designer', icon: '🎯', label: 'Lab Designer' },
+    ],
+
+    // State
+    loading: false,
+    statusMsg: '',
+    data: {},
+    vmList: [],
+    containerList: {},
+    interfaces: [],
+    firewallRules: [],
+    handoffs: [],
+
+    // VM page
+    newSnapName: '',
+
+    // Docker page
+    logContainer: '',
+    logContent: '',
+    buildRunning: false,
+    buildOutput: [],
+
+    // Network page
+    editIface: null,
+    editIfaceIP: '',
+    editIfacePrefix: 24,
+    newRule: { name: '', direction: 'Inbound', protocol: 'TCP', local_port: '', remote_address: '' },
+
+    // Deploy page
+    deployOpts: { company: '', seed: '' },
+
+    // Designer page
+    catalog: {},
+    scenarioList: [],
+    designer: { name: '', description: '', difficulty: 'easy', machines: [], _id: null },
+    vulnCategories: ['credential_access', 'ad_misconfig', 'certificate_abuse', 'delegation_abuse', 'protocol_weakness', 'secret_exposure', 'lateral_movement', 'privilege_escalation'],
+    playbookPreview: '',
+    scenarioDeployRunning: false,
+    scenarioDeployOutput: [],
+
+    // Polling
+    _interval: null,
+
+    async init() {
+      const saved = localStorage.getItem('labinator_token');
+      if (saved) {
+        this.token = saved;
+        this.authed = true;
+        await this.refresh();
+        this._interval = setInterval(() => this.refresh(), 10000);
+      }
+      this.setupWatchers();
+    },
+
+    async login() {
+      this.loginError = '';
+      try {
+        const r = await fetch('/api/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: this.tokenInput }),
+        });
+        if (r.ok) {
+          this.token = this.tokenInput;
+          localStorage.setItem('labinator_token', this.token);
+          this.authed = true;
+          await this.refresh();
+          this._interval = setInterval(() => this.refresh(), 10000);
+        } else {
+          this.loginError = 'Invalid token';
+        }
+      } catch (e) {
+        this.loginError = 'Connection failed';
+      }
+    },
+
+    logout() {
+      this.authed = false;
+      this.token = '';
+      localStorage.removeItem('labinator_token');
+      if (this._interval) clearInterval(this._interval);
+    },
+
+    headers() {
+      return { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' };
+    },
+
+    async api(method, url, body) {
+      const opts = { method, headers: this.headers() };
+      if (body) opts.body = JSON.stringify(body);
+      const r = await fetch(url, opts);
+      if (r.status === 401) { this.logout(); throw new Error('Unauthorized'); }
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        throw new Error(e.detail || `HTTP ${r.status}`);
+      }
+      return r.json();
+    },
+
+    async refresh() {
+      this.loading = true;
+      try {
+        this.data = await this.api('GET', '/api/overview');
+      } catch (e) {
+        this.statusMsg = 'Refresh failed: ' + e.message;
+      }
+      this.loading = false;
+    },
+
+    async refreshVMs() {
+      this.loading = true;
+      try { this.vmList = await this.api('GET', '/api/vms'); }
+      catch (e) { this.statusMsg = e.message; }
+      this.loading = false;
+    },
+
+    async vmAction(vmId, action) {
+      try {
+        this.statusMsg = `VM ${action}…`;
+        await this.api('POST', '/api/vms/action', { vm_id: vmId, action });
+        this.statusMsg = `VM ${action} OK`;
+        setTimeout(() => this.refreshVMs(), 2000);
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    async vmActionAll(action) {
+      try {
+        this.statusMsg = `${action}…`;
+        await this.api('POST', `/api/vms/${action}`);
+        this.statusMsg = `${action} OK`;
+        setTimeout(() => this.refreshVMs(), 3000);
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    async snapAction(vmId, action, name) {
+      if (!name) return;
+      if (action === 'delete' && !confirm(`Delete snapshot "${name}"?`)) return;
+      try {
+        this.statusMsg = `Snapshot ${action}…`;
+        await this.api('POST', '/api/vms/snapshots', { vm_id: vmId, action, name });
+        this.statusMsg = `Snapshot ${action} OK`;
+        await this.refreshVMs();
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    async refreshContainers() {
+      this.loading = true;
+      try { this.containerList = await this.api('GET', '/api/containers'); }
+      catch (e) { this.statusMsg = e.message; }
+      this.loading = false;
+    },
+
+    async containerAction(name, action) {
+      try {
+        this.statusMsg = `${name} ${action}…`;
+        await this.api('POST', '/api/containers/action', { name, action });
+        this.statusMsg = `${name} ${action} OK`;
+        setTimeout(() => this.refreshContainers(), 2000);
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    async viewLogs(name) {
+      try {
+        const r = await this.api('GET', `/api/containers/logs/${encodeURIComponent(name)}`);
+        this.logContainer = name;
+        this.logContent = r.logs;
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    startBuild() {
+      this.buildRunning = true;
+      this.buildOutput = [];
+      const ws = new WebSocket(`ws://${location.host}/ws/build?token=${encodeURIComponent(this.token)}`);
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'output') {
+          this.buildOutput.push(msg.data);
+          this.$nextTick(() => {
+            if (this.$refs.buildLog) this.$refs.buildLog.scrollTop = this.$refs.buildLog.scrollHeight;
+          });
+        } else if (msg.type === 'status') {
+          this.statusMsg = msg.data;
+          if (msg.data.includes('complete')) {
+            this.buildRunning = false;
+            this.refreshContainers();
+          }
+        } else if (msg.type === 'error') {
+          this.statusMsg = 'Build error: ' + msg.data;
+          this.buildRunning = false;
+        }
+      };
+      ws.onerror = () => { this.buildRunning = false; this.statusMsg = 'WebSocket error'; };
+      ws.onclose = () => { this.buildRunning = false; };
+    },
+
+    async refreshNetwork() {
+      this.loading = true;
+      try {
+        this.interfaces = await this.api('GET', '/api/network/interfaces');
+        this.firewallRules = await this.api('GET', '/api/network/firewall');
+      } catch (e) { this.statusMsg = e.message; }
+      this.loading = false;
+    },
+
+    async configureIface() {
+      if (!this.editIface) return;
+      try {
+        await this.api('POST', '/api/network/interfaces', {
+          alias: this.editIface.alias,
+          ip_address: this.editIfaceIP,
+          prefix_length: parseInt(this.editIfacePrefix),
+        });
+        this.editIface = null;
+        this.statusMsg = 'Interface configured';
+        await this.refreshNetwork();
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    async addFirewall() {
+      try {
+        await this.api('POST', '/api/network/firewall', this.newRule);
+        this.newRule = { name: '', direction: 'Inbound', protocol: 'TCP', local_port: '', remote_address: '' };
+        this.statusMsg = 'Rule added';
+        await this.refreshNetwork();
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    async deleteFirewall(name) {
+      if (!confirm(`Delete rule "${name}"?`)) return;
+      try {
+        await this.api('DELETE', `/api/network/firewall/${encodeURIComponent(name)}`);
+        this.statusMsg = 'Rule deleted';
+        await this.refreshNetwork();
+      } catch (e) { this.statusMsg = e.message; }
+    },
+
+    // Called from init — watch page changes
+    setupWatchers() {
+      this.$watch('page', (val) => {
+        if (val === 'vms') this.refreshVMs();
+        else if (val === 'docker') this.refreshContainers();
+        else if (val === 'network') this.refreshNetwork();
+        else if (val === 'deploy') this.loadHandoffs();
+        else if (val === 'designer') this.loadCatalog();
+      });
+    },
+
+    async loadHandoffs() {
+      try { this.handoffs = await this.api('GET', '/api/lab/handoffs'); }
+      catch (e) { this.statusMsg = e.message; }
+    },
+
+    // ── Designer Methods ──
+
+    async loadCatalog() {
+      try {
+        this.catalog = await this.api('GET', '/api/scenarios/catalog');
+        this.scenarioList = await this.api('GET', '/api/scenarios');
+      } catch (e) { this.statusMsg = 'Failed to load catalog: ' + e.message; }
+    },
+
+    addMachine() {
+      this.designer.machines.push({
+        name: 'Machine-' + (this.designer.machines.length + 1),
+        role: 'workstation',
+        target_vm: 'srv02',
+        services: [],
+        vulnerabilities: [],
+      });
+    },
+
+    toggleService(machine, svcKey) {
+      if (!machine.services) machine.services = [];
+      const idx = machine.services.findIndex(s => (typeof s === 'string' ? s : s.name) === svcKey);
+      if (idx >= 0) {
+        machine.services.splice(idx, 1);
+      } else {
+        if (svcKey === 'smb') {
+          machine.services.push({ name: 'smb', signing: false, shares: [] });
+        } else {
+          machine.services.push(svcKey);
+        }
+      }
+    },
+
+    hasService(machine, svcKey) {
+      return (machine.services || []).some(s => (typeof s === 'string' ? s : s.name) === svcKey);
+    },
+
+    getSmbConfig(machine) {
+      if (!machine.services) machine.services = [];
+      let smb = machine.services.find(s => typeof s === 'object' && s.name === 'smb');
+      if (!smb) {
+        smb = { name: 'smb', signing: false, shares: [] };
+        machine.services.push(smb);
+      }
+      if (!smb.shares) smb.shares = [];
+      return smb;
+    },
+
+    toggleVuln(machine, vulnKey) {
+      if (!machine.vulnerabilities) machine.vulnerabilities = [];
+      const idx = machine.vulnerabilities.findIndex(v => (typeof v === 'string' ? v : v.id) === vulnKey);
+      if (idx >= 0) {
+        machine.vulnerabilities.splice(idx, 1);
+      } else {
+        machine.vulnerabilities.push(vulnKey);
+      }
+    },
+
+    hasVuln(machine, vulnKey) {
+      return (machine.vulnerabilities || []).some(v => (typeof v === 'string' ? v : v.id) === vulnKey);
+    },
+
+    getVulnsForCategory(cat) {
+      const all = this.catalog.vulnerabilities || {};
+      const result = {};
+      for (const [k, v] of Object.entries(all)) {
+        if (v.category === cat) result[k] = v;
+      }
+      return result;
+    },
+
+    hasVulnsForRole(cat, role) {
+      const vulns = this.getVulnsForCategory(cat);
+      return Object.values(vulns).some(v => v.targets && v.targets.includes(role));
+    },
+
+    severityBtnClass(severity) {
+      const map = {
+        critical: 'bg-red-700 text-red-100 border border-red-500',
+        high: 'bg-orange-700 text-orange-100 border border-orange-500',
+        medium: 'bg-yellow-700 text-yellow-100 border border-yellow-500',
+        low: 'bg-blue-700 text-blue-100 border border-blue-500',
+      };
+      return map[severity] || 'bg-slate-600 text-white';
+    },
+
+    severityIcon(severity) {
+      return { critical: '🔴', high: '🟠', medium: '🟡', low: '🔵' }[severity] || '⚪';
+    },
+
+    async loadScenario(id) {
+      try {
+        const s = await this.api('GET', `/api/scenarios/${encodeURIComponent(id)}`);
+        this.designer = {
+          name: s.name || '',
+          description: s.description || '',
+          difficulty: s.difficulty || 'easy',
+          machines: s.machines || [],
+          _id: s._id || id,
+        };
+        this.statusMsg = `Loaded scenario: ${s.name}`;
+      } catch (e) { this.statusMsg = 'Load failed: ' + e.message; }
+    },
+
+    async saveCurrentScenario() {
+      try {
+        const r = await this.api('POST', '/api/scenarios', {
+          scenario: {
+            name: this.designer.name,
+            description: this.designer.description,
+            difficulty: this.designer.difficulty,
+            machines: this.designer.machines,
+          },
+          scenario_id: this.designer._id,
+        });
+        this.designer._id = r.scenario_id;
+        this.scenarioList = await this.api('GET', '/api/scenarios');
+        this.statusMsg = `Scenario saved: ${this.designer.name}`;
+      } catch (e) {
+        const detail = e.message;
+        this.statusMsg = 'Save failed: ' + detail;
+      }
+    },
+
+    async deleteCurrentScenario() {
+      if (!this.designer._id) return;
+      if (!confirm(`Delete scenario "${this.designer.name}"?`)) return;
+      try {
+        await this.api('DELETE', `/api/scenarios/${this.designer._id}`);
+        this.scenarioList = await this.api('GET', '/api/scenarios');
+        this.statusMsg = `Deleted: ${this.designer.name}`;
+        this.designer = { name: '', description: '', difficulty: 'easy', machines: [], _id: null };
+      } catch (e) {
+        this.statusMsg = 'Delete failed: ' + e.message;
+      }
+    },
+
+    async previewPlaybook() {
+      try {
+        const r = await this.api('POST', '/api/scenarios/preview-inline', {
+          name: this.designer.name || 'Preview',
+          description: this.designer.description,
+          difficulty: this.designer.difficulty,
+          machines: this.designer.machines,
+        });
+        this.playbookPreview = r.summary + '\n\n' + r.playbook;
+      } catch (e) { this.statusMsg = 'Preview failed: ' + e.message; }
+    },
+
+    async deployScenario() {
+      if (!this.designer._id) {
+        this.statusMsg = 'Save the scenario first before deploying';
+        return;
+      }
+      try {
+        this.scenarioDeployRunning = true;
+        this.scenarioDeployOutput = ['Starting deployment…'];
+        await this.api('POST', `/api/scenarios/${encodeURIComponent(this.designer._id)}/deploy`);
+        // Stream via WebSocket
+        const ws = new WebSocket(`ws://${location.host}/ws/scenario-deploy?token=${encodeURIComponent(this.token)}`);
+        ws.onmessage = (e) => {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'output') {
+            this.scenarioDeployOutput.push(msg.data);
+            this.$nextTick(() => {
+              if (this.$refs.deployLog) this.$refs.deployLog.scrollTop = this.$refs.deployLog.scrollHeight;
+            });
+          } else if (msg.type === 'status' && msg.data === 'complete') {
+            this.scenarioDeployRunning = false;
+            this.scenarioDeployOutput.push('=== Deployment complete ===');
+          }
+        };
+        ws.onerror = () => { this.scenarioDeployRunning = false; this.statusMsg = 'Deploy WebSocket error'; };
+        ws.onclose = () => { this.scenarioDeployRunning = false; };
+      } catch (e) {
+        this.scenarioDeployRunning = false;
+        this.statusMsg = 'Deploy failed: ' + e.message;
+      }
+    },
+  };
+}
+</script>
+</body>
+</html>

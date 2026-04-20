@@ -1,0 +1,71 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Scenario: AD Escalation Gauntlet
+# Chain through Kerberos, delegation, and ACL abuse to reach DA
+# ═══════════════════════════════════════════════════════════════════════════
+name: AD Escalation Gauntlet
+description: >
+  A realistic corporate AD environment with multiple escalation paths.
+  Start with a low-priv user and chain Kerberoasting → delegation abuse
+  → ACL exploitation → DCSync to achieve Domain Admin.
+difficulty: medium
+author: labinator
+tags: [ad, kerberos, delegation, acl, escalation]
+
+machines:
+  - name: DC-KING
+    role: domain_controller
+    target_vm: dc01
+    services:
+      - ldap
+      - dns
+      - adcs
+    vulnerabilities:
+      - id: kerberoastable_spns
+        accounts: [svc_backup, svc_web, svc_mssql]
+        weak_passwords: true
+      - id: asrep_roastable
+        accounts: [temp.contractor, old.admin]
+      - id: weak_acls
+        chains: [GenericAll, WriteDACL, ForceChangePassword]
+      - gpp_passwords
+      - credential_in_sysvol
+      - print_spooler_on_dc
+      - ntlmv1_allowed
+      - adcs_esc1
+
+  - name: DC-NORTH
+    role: domain_controller
+    target_vm: dc02
+    services:
+      - ldap
+      - dns
+    vulnerabilities:
+      - id: dcsync_acl
+      - llmnr_enabled
+      - ldap_signing_disabled
+
+  - name: SRV-FILES
+    role: file_server
+    target_vm: srv02
+    services:
+      - name: smb
+        signing: false
+        shares: [Public, IT-Docs, Backups]
+      - rdp
+      - mssql
+    vulnerabilities:
+      - unconstrained_delegation
+      - smb_signing_disabled
+      - no_laps
+      - id: share_with_passwords
+        share_name: IT-Docs
+      - autologon_credentials
+      - mssql_impersonation
+      - psremoting_open
+
+objectives:
+  - "Kerberoast svc_backup and crack the hash"
+  - "Use cracked credential to access file shares"
+  - "Find delegation abuse path to DC"
+  - "Exploit ADCS ESC1 for domain admin certificate"
+  - "DCSync the domain"

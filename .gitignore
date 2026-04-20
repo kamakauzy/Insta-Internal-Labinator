@@ -16,7 +16,9 @@ vmnet-config.txt
 *.bak
 *.v2bak
 *.v3
-dashboard/
+dashboard/__pycache__/
+dashboard/services/__pycache__/
+dashboard/.auth_token
 internal-inator/
 .venv/
 .kube/

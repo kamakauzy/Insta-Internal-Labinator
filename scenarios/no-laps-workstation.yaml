@@ -1,0 +1,41 @@
+name: No-LAPS Workstation Takeover
+description: 'Classic assumed-breach scenario: Windows workstation with SMB enabled,
+  no LAPS, SMB signing disabled, and a share full of passwords. Can you relay your
+  way to Domain Admin?
+
+  '
+difficulty: easy
+machines:
+- name: WS01
+  role: workstation
+  target_vm: srv02
+  services:
+  - name: smb
+    signing: false
+    shares:
+    - Finance
+    - IT-Backup
+  - rdp
+  - winrm
+  vulnerabilities:
+  - no_laps
+  - smb_signing_disabled
+  - llmnr_enabled
+  - id: share_with_passwords
+    share_name: IT-Backup
+  - autologon_credentials
+  - psremoting_open
+  - unconstrained_delegation
+- name: DC01
+  role: domain_controller
+  target_vm: dc01
+  services:
+  - ldap
+  - dns
+  vulnerabilities:
+  - id: kerberoastable_spns
+    accounts:
+    - svc_backup
+  - null_sessions
+  - print_spooler_on_dc
+updated_at: '2026-04-20T01:49:38.962505+00:00'

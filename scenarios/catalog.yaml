@@ -1,0 +1,545 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Labinator Vulnerability & Service Catalog
+# Every injectable vulnerability, service, and role available for lab design.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Machine Roles ────────────────────────────────────────────────────────
+roles:
+  domain_controller:
+    label: Domain Controller
+    icon: 🏰
+    os: [windows_server_2019, windows_server_2022]
+    description: Active Directory Domain Controller (DNS, Kerberos, LDAP)
+    maps_to: [dc01, dc02]   # GOAD VM targets
+
+  file_server:
+    label: File Server
+    icon: 📁
+    os: [windows_server_2019, windows_server_2022]
+    description: Windows file server with SMB shares
+    maps_to: [srv02]
+
+  workstation:
+    label: Workstation
+    icon: 💻
+    os: [windows_server_2019, windows_10, windows_11]
+    description: User workstation (often domain-joined)
+    maps_to: [srv02]  # GOAD SRV02 doubles as workstation target
+
+  database_server:
+    label: Database Server
+    icon: 🗄️
+    os: [windows_server_2019]
+    description: MSSQL Server with impersonation chains
+    maps_to: [srv02]
+
+  web_server:
+    label: Web Server
+    icon: 🌐
+    os: [windows_server_2019, ubuntu_22]
+    description: IIS or Apache/Nginx web server
+    maps_to: [srv02, lx01]
+
+  linux_server:
+    label: Linux Server
+    icon: 🐧
+    os: [ubuntu_22, kali]
+    description: Linux domain member or standalone
+    maps_to: [lx01]
+
+  certificate_authority:
+    label: Certificate Authority (ADCS)
+    icon: 📜
+    os: [windows_server_2019]
+    description: Active Directory Certificate Services
+    maps_to: [dc01]
+
+# ── Services ─────────────────────────────────────────────────────────────
+services:
+  smb:
+    label: SMB File Sharing
+    icon: 📂
+    ports: [445, 139]
+    roles: [file_server, workstation, domain_controller]
+    configurable:
+      signing: { type: bool, default: true, label: "SMB Signing Required" }
+      shares: { type: list, label: "Share Names", default: [] }
+
+  rdp:
+    label: Remote Desktop
+    icon: 🖥️
+    ports: [3389]
+    roles: [workstation, file_server, database_server]
+
+  mssql:
+    label: Microsoft SQL Server
+    icon: 🗄️
+    ports: [1433]
+    roles: [database_server]
+    configurable:
+      sa_password: { type: string, label: "SA Password", default: "" }
+      impersonation: { type: bool, label: "Impersonation chains", default: false }
+
+  iis:
+    label: IIS Web Server
+    icon: 🌐
+    ports: [80, 443]
+    roles: [web_server]
+    configurable:
+      webdav: { type: bool, label: "WebDAV enabled", default: false }
+
+  adcs:
+    label: AD Certificate Services
+    icon: 📜
+    ports: [443]
+    roles: [certificate_authority]
+
+  dns:
+    label: DNS Server
+    icon: 🔤
+    ports: [53]
+    roles: [domain_controller]
+
+  ldap:
+    label: LDAP
+    icon: 📒
+    ports: [389, 636]
+    roles: [domain_controller]
+    configurable:
+      signing: { type: bool, label: "LDAP Signing Required", default: true }
+      channel_binding: { type: bool, label: "Channel Binding", default: true }
+
+  winrm:
+    label: WinRM
+    icon: ⚙️
+    ports: [5985, 5986]
+    roles: [workstation, file_server, database_server, domain_controller]
+
+  ssh:
+    label: SSH
+    icon: 🔑
+    ports: [22]
+    roles: [linux_server]
+
+  print_spooler:
+    label: Print Spooler
+    icon: 🖨️
+    ports: []
+    roles: [domain_controller, file_server, workstation]
+    configurable:
+      enabled: { type: bool, label: "Spooler running", default: false }
+
+# ── Vulnerability Categories ─────────────────────────────────────────────
+vulnerability_categories:
+  credential_access:
+    label: Credential Access
+    icon: 🔑
+    color: "#ef4444"
+
+  ad_misconfig:
+    label: AD Misconfiguration
+    icon: ⚙️
+    color: "#f97316"
+
+  certificate_abuse:
+    label: Certificate Abuse (ADCS)
+    icon: 📜
+    color: "#a855f7"
+
+  delegation_abuse:
+    label: Delegation Abuse
+    icon: 🔗
+    color: "#3b82f6"
+
+  protocol_weakness:
+    label: Protocol Weakness
+    icon: 📡
+    color: "#eab308"
+
+  secret_exposure:
+    label: Secret Exposure
+    icon: 🗝️
+    color: "#22c55e"
+
+  lateral_movement:
+    label: Lateral Movement
+    icon: ➡️
+    color: "#06b6d4"
+
+  privilege_escalation:
+    label: Privilege Escalation
+    icon: ⬆️
+    color: "#ec4899"
+
+# ── Vulnerabilities ──────────────────────────────────────────────────────
+vulnerabilities:
+
+  # ─── Credential Access ───
+  kerberoastable_spns:
+    label: Kerberoastable SPNs
+    category: credential_access
+    severity: high
+    mitre: T1558.003
+    description: Service accounts with SPNs crackable via Kerberoasting
+    targets: [domain_controller]
+    ansible_role: kerberoast_setup
+    configurable:
+      accounts:
+        type: list
+        label: "Service accounts"
+        default: [svc_backup, svc_web, svc_mssql]
+      weak_passwords:
+        type: bool
+        label: "Use weak/crackable passwords"
+        default: true
+
+  asrep_roastable:
+    label: AS-REP Roastable Accounts
+    category: credential_access
+    severity: high
+    mitre: T1558.004
+    description: Accounts without Kerberos pre-authentication
+    targets: [domain_controller]
+    ansible_role: asrep_setup
+    configurable:
+      accounts:
+        type: list
+        label: "Vulnerable accounts"
+        default: [dev.legacy, temp.contractor]
+
+  gpp_passwords:
+    label: GPP Passwords (cpassword)
+    category: credential_access
+    severity: high
+    mitre: T1552.006
+    description: Group Policy Preferences with embedded passwords
+    targets: [domain_controller]
+    ansible_role: gpp_password_setup
+
+  password_in_description:
+    label: Passwords in AD Description
+    category: credential_access
+    severity: high
+    mitre: T1552.005
+    description: User accounts with plaintext passwords in description field
+    targets: [domain_controller]
+    ansible_role: password_description_setup
+    configurable:
+      accounts:
+        type: list
+        label: "Accounts with password in description"
+        default: [svc_backup]
+
+  autologon_credentials:
+    label: Autologon Credentials
+    category: credential_access
+    severity: medium
+    mitre: T1552.002
+    description: Registry autologon with plaintext domain credentials
+    targets: [workstation, file_server]
+    ansible_role: autologon_setup
+
+  credential_in_sysvol:
+    label: Credentials in SYSVOL Scripts
+    category: credential_access
+    severity: high
+    mitre: T1552.006
+    description: Plaintext passwords in SYSVOL login scripts
+    targets: [domain_controller]
+    ansible_role: sysvol_creds_setup
+
+  # ─── AD Misconfiguration ───
+  no_laps:
+    label: LAPS Not Deployed
+    category: ad_misconfig
+    severity: medium
+    mitre: T1078.002
+    description: Local admin passwords not managed by LAPS — same password everywhere
+    targets: [workstation, file_server]
+    ansible_role: disable_laps
+
+  weak_acls:
+    label: Weak AD ACLs
+    category: ad_misconfig
+    severity: critical
+    mitre: T1222.001
+    description: GenericAll, WriteDACL, WriteOwner on privileged objects
+    targets: [domain_controller]
+    ansible_role: acl_abuse_setup
+    configurable:
+      chains:
+        type: list
+        label: "ACL abuse chains"
+        default: [GenericAll, WriteDACL, ForceChangePassword]
+
+  dcsync_acl:
+    label: DCSync ACL Path
+    category: ad_misconfig
+    severity: critical
+    mitre: T1003.006
+    description: Low-priv user with replication rights (DCSync)
+    targets: [domain_controller]
+    ansible_role: dcsync_acl_setup
+
+  adminsdh_backdoor:
+    label: AdminSDHolder Backdoor
+    category: ad_misconfig
+    severity: critical
+    mitre: T1098
+    description: AdminSDHolder modified for persistent privileged access
+    targets: [domain_controller]
+    ansible_role: adminsdh_setup
+
+  null_sessions:
+    label: Null Session Permitted
+    category: ad_misconfig
+    severity: medium
+    mitre: T1087.002
+    description: Anonymous/null session enumeration enabled
+    targets: [domain_controller, file_server]
+    ansible_role: null_session_setup
+
+  machine_account_quota:
+    label: Machine Account Quota > 0
+    category: ad_misconfig
+    severity: medium
+    mitre: T1136.002
+    description: Domain users can create machine accounts (MachineAccountQuota > 0)
+    targets: [domain_controller]
+    ansible_role: maq_setup
+
+  # ─── Certificate Abuse ───
+  adcs_esc1:
+    label: "ADCS ESC1 — Enrollee Supplies Subject"
+    category: certificate_abuse
+    severity: critical
+    mitre: T1649
+    description: Certificate template allows requestor to specify SAN
+    targets: [certificate_authority, domain_controller]
+    ansible_role: adcs_esc1_setup
+
+  adcs_esc4:
+    label: "ADCS ESC4 — Template Modification"
+    category: certificate_abuse
+    severity: critical
+    mitre: T1649
+    description: Low-priv user can modify certificate template
+    targets: [certificate_authority]
+    ansible_role: adcs_esc4_setup
+
+  adcs_esc8:
+    label: "ADCS ESC8 — NTLM Relay to HTTP Enrollment"
+    category: certificate_abuse
+    severity: critical
+    mitre: T1187
+    description: Web enrollment endpoint without EPA allows NTLM relay
+    targets: [certificate_authority]
+    ansible_role: adcs_esc8_setup
+
+  # ─── Delegation Abuse ───
+  unconstrained_delegation:
+    label: Unconstrained Delegation
+    category: delegation_abuse
+    severity: critical
+    mitre: T1558.001
+    description: Server trusted for delegation — captures any TGT
+    targets: [file_server, workstation]
+    ansible_role: unconstrained_deleg_setup
+
+  constrained_delegation:
+    label: Constrained Delegation (to DC)
+    category: delegation_abuse
+    severity: critical
+    mitre: T1558.001
+    description: Service can delegate to DC services (CIFS, LDAP)
+    targets: [file_server, database_server]
+    ansible_role: constrained_deleg_setup
+    configurable:
+      target_spn:
+        type: string
+        label: "Target SPN"
+        default: "CIFS/dc01.sevenkingdoms.local"
+
+  rbcd:
+    label: Resource-Based Constrained Delegation
+    category: delegation_abuse
+    severity: critical
+    mitre: T1558.001
+    description: RBCD attack path via msDS-AllowedToActOnBehalfOfOtherIdentity
+    targets: [file_server, workstation]
+    ansible_role: rbcd_setup
+
+  # ─── Protocol Weakness ───
+  smb_signing_disabled:
+    label: SMB Signing Not Required
+    category: protocol_weakness
+    severity: high
+    mitre: T1557.001
+    description: SMB signing disabled — enables relay attacks
+    targets: [file_server, workstation]
+    ansible_role: smb_signing_disable
+
+  llmnr_enabled:
+    label: LLMNR/NBT-NS Enabled
+    category: protocol_weakness
+    severity: high
+    mitre: T1557.001
+    description: LLMNR and NBT-NS broadcast poisoning
+    targets: [workstation, file_server, domain_controller]
+    ansible_role: enable_llmnr
+
+  ntlmv1_allowed:
+    label: NTLMv1 Allowed
+    category: protocol_weakness
+    severity: high
+    mitre: T1557.001
+    description: Legacy NTLMv1 authentication enabled
+    targets: [domain_controller]
+    ansible_role: ntlmv1_enable
+
+  ldap_signing_disabled:
+    label: LDAP Signing Not Required
+    category: protocol_weakness
+    severity: medium
+    mitre: T1557
+    description: LDAP signing not enforced — enables relay
+    targets: [domain_controller]
+    ansible_role: ldap_signing_disable
+
+  # ─── Secret Exposure ───
+  share_with_passwords:
+    label: Share Containing Passwords
+    category: secret_exposure
+    severity: high
+    mitre: T1552.001
+    description: File share with plaintext password files
+    targets: [file_server, workstation]
+    ansible_role: share_secrets_setup
+    configurable:
+      share_name:
+        type: string
+        label: "Share name"
+        default: "IT-Backup"
+      secrets:
+        type: list
+        label: "Secret files to plant"
+        default:
+          - { filename: "passwords.txt", content: "domain_admin" }
+
+  share_with_aws_keys:
+    label: AWS Credentials in Share
+    category: secret_exposure
+    severity: critical
+    mitre: T1552.001
+    description: AWS access keys exposed in file share
+    targets: [file_server, workstation]
+    ansible_role: share_aws_setup
+    configurable:
+      share_name:
+        type: string
+        label: "Share name"
+        default: "DevOps-Backup"
+      profile:
+        type: string
+        label: "AWS profile name"
+        default: "prod"
+
+  share_with_ssh_keys:
+    label: SSH Private Keys in Share
+    category: secret_exposure
+    severity: critical
+    mitre: T1552.004
+    description: SSH private keys exposed in file share
+    targets: [file_server, workstation]
+    ansible_role: share_ssh_keys_setup
+    configurable:
+      share_name:
+        type: string
+        label: "Share name"
+        default: "Admin-Tools"
+
+  share_with_azure_tokens:
+    label: Azure Tokens/Certs in Share
+    category: secret_exposure
+    severity: critical
+    mitre: T1552.001
+    description: Azure service principal certs or tokens in share
+    targets: [file_server, workstation]
+    ansible_role: share_azure_setup
+
+  # ─── Lateral Movement ───
+  psremoting_open:
+    label: PSRemoting Open
+    category: lateral_movement
+    severity: medium
+    mitre: T1021.006
+    description: PowerShell Remoting enabled for domain users
+    targets: [workstation, file_server]
+    ansible_role: psremoting_setup
+
+  mssql_impersonation:
+    label: MSSQL Impersonation Chain
+    category: lateral_movement
+    severity: high
+    mitre: T1078.002
+    description: MSSQL EXECUTE AS chain to sa privileges
+    targets: [database_server, file_server]
+    ansible_role: mssql_impersonation_setup
+
+  # ─── Privilege Escalation ───
+  print_spooler_on_dc:
+    label: Print Spooler on DC
+    category: privilege_escalation
+    severity: high
+    mitre: T1547.012
+    description: Print Spooler service running on DC — PrinterBug/SpoolSample
+    targets: [domain_controller, certificate_authority]
+    ansible_role: spooler_dc_setup
+
+  webdav_enabled:
+    label: WebDAV on Server
+    category: privilege_escalation
+    severity: medium
+    mitre: T1021
+    description: WebDAV enabled — enables NTLM auth coercion
+    targets: [file_server, web_server]
+    ansible_role: webdav_setup
+
+  dnsadmins_abuse:
+    label: DnsAdmins Group Membership
+    category: privilege_escalation
+    severity: critical
+    mitre: T1574
+    description: Low-priv user in DnsAdmins — can load arbitrary DLL on DC
+    targets: [domain_controller]
+    ansible_role: dnsadmins_setup
+
+# ── Difficulty Presets ───────────────────────────────────────────────────
+difficulty_presets:
+  easy:
+    label: Easy
+    color: "#22c55e"
+    description: "Few machines, obvious vulns, credentials lying around"
+    max_machines: 3
+    vuln_density: high  # many vulns per machine
+
+  medium:
+    label: Medium
+    color: "#eab308"
+    description: "Realistic corporate network, mixed attack paths"
+    max_machines: 4
+    vuln_density: medium
+
+  hard:
+    label: Hard
+    color: "#ef4444"
+    description: "Minimal vulns, chained exploitation required"
+    max_machines: 4
+    vuln_density: low
+
+  insane:
+    label: Insane
+    color: "#a855f7"
+    description: "Single subtle misconfig, full chain required for DA"
+    max_machines: 4
+    vuln_density: minimal
